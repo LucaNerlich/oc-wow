@@ -3,20 +3,19 @@
 ## Prerequisites
 
 * **Rust** — to build the companion (`cargo`, 1.74+).
-* **OpenCode V2** — the `opencode2` CLI. The companion talks to the background
-  service over HTTP; it discovers the URL and password from
-  `~/.local/state/opencode/service.json` (written by the service). You do not
-  need to start a server yourself, but the service must be running and you must
-  have authenticated any providers whose models you want to use.
-* **World of Warcraft** — windowed or borderless, with the strip visible.
-* **Python 3** — only for the optional development tools.
+* **OpenCode V2** — the `opencode2` CLI. The companion discovers the background
+  service's URL and password from `~/.local/state/opencode/service.json`.
+* **World of Warcraft** — **windowed or borderless**; exclusive fullscreen blocks
+  screen capture.
+* **macOS** — Screen Recording permission for the terminal you run `ocw` from
+  (System Settings → Privacy & Security → Screen Recording). Restart the terminal
+  after granting it.
 
 Verify the server first:
 
 ```sh
 ocw ping        # prints the URL, health and version
 ocw models      # lists available models (provider/model)
-ocw projects    # lists projects the server already knows about
 ```
 
 ## 1. Build
@@ -26,65 +25,49 @@ cd companion
 cargo build --release
 ```
 
-The resulting binary is `companion/target/release/ocw`.
-
-## 2. Install the addon
+## 2. Install the addon and the slot bank
 
 ```sh
 ocw install --addon-dir "/Applications/World of Warcraft/_classic_beta_/Interface/AddOns/OCWow"
 ```
 
-This writes the Lua files and creates the font bank (`Fonts/fontreplyNNNN.ttf`,
-4096 slots by default, hard-linked to one baseline font). Use `--slots` to
-change the size and `--force` to rewrite existing slots — **never** use
-`--force` while the game is running.
+This writes the Lua files, creates 200 `OCWow_Snnn` load-on-demand addons beside
+them, and pre-creates the signal files (`sig/`, `ack/`, `ctl/`) **empty** — they
+must exist when the client launches.
 
-The addon directory is auto-detected for common WoW installations on macOS,
-Windows and Linux (Proton). `ocw paths` shows what was detected.
+**Fully quit and relaunch WoW.** The client only discovers addon files that
+existed at startup. On the AddOns screen enable **OCWow** and leave the
+`OCWow Slot …` entries disabled; they are transport files, not features.
 
-Enable the addon in game, then `/reload`. If the client does not discover the
-new font files, restart it fully once.
+`ocw paths` shows what was detected, including the strip rectangle.
 
-## 3. Calibrate the strip
+## 3. Find the strip
 
-The addon draws the strip in the top-left corner of the UI. Its screen position
-depends on your window position, monitor layout and UI scale.
-
-In game:
+In game, open the panel and run:
 
 ```
-/ocw calibrate
+/ocw test
 ```
 
-This paints a fixed, valid frame so the strip is easy to find. Then:
+That puts a strip on screen and holds it there. Then, in a terminal:
 
 ```sh
 ocw probe
 ```
 
-`probe` captures your configured region (whole screen by default on macOS) and
-searches for the strip, printing a suggested crop:
+`probe` captures the screen, finds the strip by its fixed magic bytes, validates
+the frame, and saves the rectangle to the config:
 
 ```
-found strip: cell=4px, offset=(12, 34), frame type=control
-suggested: --crop 20,42,512,16
+strip found: cell 4px at image (612, 148), capture scale 2
+screen rectangle: 848x240 points at 282,50
+saved to ~/.config/ocw/config.json
 ```
 
-Save that crop in your config or pass it to `run`:
-
-```sh
-ocw run --crop 20,42,512,16 --cell 0
-```
-
-`--cell 0` auto-detects the cell size from the captured width, which handles
-Retina and scaled displays. Run `/ocw calibrate` again to stop the fixed frame.
-
-### macOS permissions
-
-`probe` and `run` need **Screen Recording** permission for the terminal
-application you run them from (Terminal, iTerm, VS Code, …). Grant it in
-System Settings → Privacy & Security → Screen Recording, then restart the
-terminal. Without it, `screencapture` fails or returns a blank image.
+If it reports no strip: check the window is windowed or borderless and on screen,
+that Screen Recording permission is granted, and that `/ocw test` actually drew
+something (the strip is a small band of coloured squares in the game window's
+top-left corner).
 
 ## 4. Run
 
@@ -92,121 +75,76 @@ terminal. Without it, `screencapture` fails or returns a blank image.
 ocw run --project ~/code/my-project --model opencode/mimo-v2.6-flash-free
 ```
 
-Useful flags:
-
 | Flag | Meaning |
 |------|---------|
 | `--mock` | local echo backend; verifies the transport without a model |
-| `--project DIR` | default project directory for new sessions |
+| `--project DIR` | working directory the agent runs in |
 | `--model provider/model` | default model |
-| `--crop x,y,w,h` | strip location (`full` for the whole screen) |
-| `--cell N` | cell size in pixels (`0` = auto) |
 | `--capture-cmd TEMPLATE` | custom capture command |
-| `--poll-ms N` | strip sample interval (default 120 ms) |
+| `--poll-ms N` | strip sampling interval (default 250 ms) |
 | `--duration N` | stop after N seconds |
-| `--verbose` | log decoded frames and slot writes |
+| `--verbose` | log decoded frames and publishes |
 
-In game, open the panel with `/ocw` and start typing.
+In game: `/ocw`, type a prompt, press Enter. The first thing to try is
+`ocw run --mock`, which echoes locally and proves the whole path.
+
+## Updating
+
+| Changed | Rebuild? | Re-run install? | Restart WoW? |
+|---------|----------|-----------------|--------------|
+| Addon Lua | no | yes, `--no-slots` | no, `/reload` |
+| Wire protocol / slots | yes | yes | yes |
+| Game patch | no | no | bump `## Interface:` in `OCWow.toc` |
+
+Fast loop while editing the addon:
+
+```sh
+ocw install --from addon/OCWow --no-slots
+```
 
 ## Cross-platform capture
 
 Capture is delegated to an external command so the companion stays portable. A
-template may use `{x} {y} {w} {h} {x2} {y2} {out}`.
+template may use `{x} {y} {w} {h} {x2} {y2} {out}`, and the region is in screen
+**points**.
 
-**macOS** (default):
+**macOS** (default): `screencapture -x -t png -R{x},{y},{w},{h} "{out}"`
 
-```
-screencapture -x -t png -R{x},{y},{w},{h} "{out}"
-```
-
-**Linux / Wayland** (requires `grim`):
-
-```
-grim -g "{x},{y} {w}x{h}" "{out}"
-```
+**Linux / Wayland** (`grim`): `grim -g "{x},{y} {w}x{h}" "{out}"`
 
 **Linux / X11** (ImageMagick):
+`import -window root -crop {w}x{h}+{x}+{y} "{out}"`
 
-```
-import -window root -crop {w}x{h}+{x}+{y} "{out}"
-```
+**Windows** (PowerShell + System.Drawing): see the `CopyFromScreen` approach in
+the reference implementation; pass it with `--capture-cmd`.
 
-**Windows** (PowerShell + System.Drawing):
-
-```
-powershell -NoProfile -Command "Add-Type -AssemblyName System.Drawing; \
-$b=New-Object Drawing.Bitmap {w},{h}; \
-$g=[Drawing.Graphics]::FromImage($b); \
-$g.CopyFromScreen({x},{y},0,0,$b.Size); \
-$b.Save('{out}',[Drawing.Imaging.ImageFormat]::Png)"
-```
-
-Pass it with `--capture-cmd '...'`. The captured PNG must be 8-bit RGB or RGBA,
-non-interlaced.
-
-## Updating
-
-`ocw install` deploys the addon; the sources are embedded in the binary so it
-works from anywhere. What to do depends on what changed:
-
-| Changed | Rebuild? | Font bank? |
-|---------|----------|------------|
-| Addon Lua / TOC | no (`--from`) | no (`--no-bank`) |
-| Wire protocol / font format | yes | yes (`--force`) |
-
-**Editing the addon** (fastest loop, no rebuild):
-
-```sh
-ocw install --from addon/OCWow --no-bank
-```
-
-**Normal update:**
-
-```sh
-cargo build --release
-./target/release/ocw install
-```
-
-Then `/reload` in game.
-
-**If the font bank changed** (only after editing `companion/src/fonts/`):
-
-```sh
-# with the game CLOSED
-ocw install --force
-```
-
-`--force` rewrites all slots. Never run it while the client is running: the
-client caches font files on first use, and a slot it has already loaded cannot
-be changed safely.
-
-**After a game patch**, update `## Interface:` in `addon/OCWow/OCWow.toc` to the
-new build number (currently `16001`), or the addon is flagged out of date.
+The captured PNG must be 8-bit RGB or RGBA, non-interlaced.
 
 ## Troubleshooting
 
-**`no strip found`**
-* Run `/ocw calibrate` in game first.
-* Make sure the WoW window is not fullscreen-exclusive and the strip is not
-  covered by another window.
+**`probe` finds no strip**
+* `/ocw test` in game first — the strip is only on screen while a message is
+  unacknowledged or after `/ocw test`.
+* WoW must be windowed or borderless.
 * Grant Screen Recording permission and restart the terminal.
-* Try `ocw probe --crop full`.
+* `--capture-cmd` if `screencapture` is not what you want.
 
-**`transport stalled` in game**
-* The companion is not running, or its crop is wrong.
-* Check `ocw run --verbose`: it logs each decoded frame and slot write.
-* If the strip is on a second monitor, recalibrate with the window where it is.
+**In game: "bridge not answering"**
+* The companion is not running, or the strip is not being seen. Run
+  `ocw run --verbose`: it logs `strip frame N: … bytes` when it decodes one.
+* Re-run `ocw probe` if the game window moved.
 
-**`font bank exhausted`**
-* Restart the game client and the companion. The companion detects the new
-  process and rewinds the counter. Increase `--slots` if this happens often.
+**"slots missing"**
+* `ocw install` was not run, or WoW has not been restarted since. The slot addons
+  must exist at launch.
 
-**Answers never arrive but prompts do**
-* The inbound channel is the empirical part. Confirm the font bank exists at
-  `ocw paths`, and that `/reload` happened after installation.
-* `ocw dump --slot N` decodes a slot; `tools/validate_font.py` checks a font
-  against macOS CoreText.
+**"slot pool used up"**
+* 200 slots are consumed by slot loads. `/reload` frees them all.
 
-**`ocw ping` fails**
-* The OpenCode service is not running: `opencode2 service status`.
-* `ocw paths` prints the discovered service URL.
+**Replies never arrive but the strip is decoded**
+* `/ocw status` in game shows the signal channel and slot state.
+* Check the slot addons exist (`ocw paths`).
+
+**Encoded messages visible on screen**
+* The strip is only up briefly after a send and is re-shown at most three times.
+* `/ocw transport off` disables it entirely.

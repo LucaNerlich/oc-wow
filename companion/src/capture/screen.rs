@@ -5,15 +5,17 @@
 //! output path; the resulting PNG is decoded by [`crate::capture::png`].
 //!
 //! macOS gets a working default (`screencapture`). Windows and Linux users
-//! supply `--capture-cmd`; see `docs/setup.md` for ready-made templates.
+//! supply `--capture-cmd`; see `docs/setup.md`.
 
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use crate::capture::png::{self, DecodedImage};
+use crate::capture::png::{self, RgbImage};
 
-/// The screen rectangle to capture.
+/// A rectangle in screen **points** (not pixels). On a Retina display a capture
+/// of `w` points yields an image `w * scale` pixels wide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Region {
     pub x: i32,
@@ -23,8 +25,8 @@ pub struct Region {
 }
 
 impl Region {
-    /// A region covering the whole screen.
-    pub fn full_screen() -> Self {
+    /// The whole screen.
+    pub fn full() -> Self {
         Region {
             x: 0,
             y: 0,
@@ -33,46 +35,37 @@ impl Region {
         }
     }
 
-    /// Whether this region means "the whole screen".
-    pub fn is_full_screen(&self) -> bool {
+    pub fn is_full(&self) -> bool {
         self.width == 0 || self.height == 0
     }
 }
 
-/// A configured screen capturer.
+/// Captures screenshots by shelling out to a platform command.
 #[derive(Debug, Clone)]
 pub struct Capturer {
-    pub region: Region,
     /// Optional command template overriding the platform default.
     pub command: Option<String>,
-    /// Cell size hint used only for reporting; decoding auto-detects it.
-    pub cell_px: u32,
+}
+
+impl Default for Capturer {
+    fn default() -> Self {
+        Self { command: None }
+    }
 }
 
 impl Capturer {
-    pub fn new(region: Region, command: Option<String>, cell_px: u32) -> Self {
-        Self {
-            region,
-            command,
-            cell_px,
-        }
+    pub fn new(command: Option<String>) -> Self {
+        Self { command }
     }
 
-    /// Capture the configured region and decode it to luminance.
-    pub fn capture(&self) -> Result<DecodedImage> {
-        let out = std::env::temp_dir().join(format!(
-            "ocw-capture-{}-{}.png",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        ));
+    /// Capture a region, or the whole screen when `region` is `None`/full.
+    pub fn capture(&self, region: Region) -> Result<RgbImage> {
+        let out = temp_path();
         let _ = std::fs::remove_file(&out);
 
         let command = match &self.command {
-            Some(template) => substitute(template, &self.region, &out),
-            None => default_command(&self.region, &out)?,
+            Some(template) => substitute(template, region, &out),
+            None => default_command(region, &out)?,
         };
 
         let status = shell_command(&command)
@@ -83,13 +76,47 @@ impl Capturer {
         }
 
         let bytes = std::fs::read(&out)
-            .with_context(|| format!("capture command produced no file at {}", out.display()))?;
+            .with_context(|| format!("capture produced no file at {}", out.display()))?;
         let _ = std::fs::remove_file(&out);
         png::decode_png(&bytes)
     }
+
+    /// Capture the whole screen.
+    pub fn capture_full(&self) -> Result<RgbImage> {
+        self.capture(Region::full())
+    }
+
+    /// How many image pixels one screen point becomes (2 on a Retina display).
+    ///
+    /// Determined empirically so the caller can convert a location found in an
+    /// image back into a screen rectangle.
+    pub fn point_scale(&self) -> Result<f64> {
+        const PROBE: u32 = 64;
+        let image = self.capture(Region {
+            x: 0,
+            y: 0,
+            width: PROBE,
+            height: PROBE,
+        })?;
+        if image.width == 0 {
+            bail!("capture returned an empty image");
+        }
+        Ok(image.width as f64 / PROBE as f64)
+    }
 }
 
-fn substitute(template: &str, region: &Region, out: &std::path::Path) -> String {
+fn temp_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "ocw-capture-{}-{}.png",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ))
+}
+
+fn substitute(template: &str, region: Region, out: &std::path::Path) -> String {
     template
         .replace("{x}", &region.x.to_string())
         .replace("{y}", &region.y.to_string())
@@ -100,12 +127,12 @@ fn substitute(template: &str, region: &Region, out: &std::path::Path) -> String 
         .replace("{out}", &out.display().to_string())
 }
 
-fn default_command(region: &Region, out: &std::path::Path) -> Result<String> {
+fn default_command(region: Region, out: &std::path::Path) -> Result<String> {
     let out = out.display();
 
     #[cfg(target_os = "macos")]
     {
-        if region.is_full_screen() {
+        if region.is_full() {
             return Ok(format!("screencapture -x -t png \"{out}\""));
         }
         return Ok(format!(
@@ -116,7 +143,7 @@ fn default_command(region: &Region, out: &std::path::Path) -> Result<String> {
 
     #[cfg(target_os = "linux")]
     {
-        if region.is_full_screen() {
+        if region.is_full() {
             return Ok(format!("grim \"{out}\""));
         }
         return Ok(format!(
@@ -169,7 +196,7 @@ mod tests {
             height: 16,
         };
         let out = std::path::Path::new("/tmp/x.png");
-        let cmd = substitute("cap {x},{y} {w}x{h} -> {out} [{x2},{y2}]", &region, out);
+        let cmd = substitute("cap {x},{y} {w}x{h} -> {out} [{x2},{y2}]", region, out);
         assert_eq!(cmd, "cap 8,16 512x16 -> /tmp/x.png [520,32]");
     }
 }

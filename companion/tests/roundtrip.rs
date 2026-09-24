@@ -1,153 +1,168 @@
 //! End-to-end transport round-trips.
 //!
-//! These exercise the two channels the way the addon and companion use them,
-//! without a game client:
-//!
-//! * outbound: encode a prompt frame, paint it into a synthetic screenshot,
-//!   decode it back through the strip sampler;
-//! * inbound: encode a reply frame into a font, read the glyph advances, and
-//!   recover the bytes with the same calibration maths the Lua receiver uses.
+//! Outbound: the addon paints a message as coloured cells; the companion finds
+//! the strip in a screenshot, decodes the frame and parses the records.
+//! Inbound: the companion writes slot data, which the addon reads back.
 
-use ocw::fonts::{build_reply_font, read_advances, ADVANCE_BASE, GLYPH_CAL_HIGH, GLYPH_CAL_LOW, GLYPH_DATA_BASE, DATA_GLYPHS};
-use ocw::protocol::frames::{reply_state, ControlFrame, PromptFrame, ReplyFrame};
-use ocw::protocol::pixel::{
-    bytes_to_cells, decode_strip, GrayImage, BYTES_PER_FRAME, STRIP_COLS, STRIP_ROWS,
+use ocw::app::Record;
+use ocw::capture::png::RgbImage;
+use ocw::capture::{find_strip, sample_strip};
+use ocw::protocol::strip::{
+    bytes_to_cells, cell_color, decode_frame, encode_frame, CELLS_PER_ROW, MAGIC,
 };
+use ocw::slots::{render_slot, Reply, ReplyStatus, SlotData};
 
-/// Paint a frame into a synthetic screenshot with a given cell size and padding.
-fn paint(bytes: &[u8; BYTES_PER_FRAME], cell: u32, pad: u32) -> (Vec<u8>, u32, u32) {
-    let width = STRIP_COLS as u32 * cell + pad * 2;
-    let height = STRIP_ROWS as u32 * cell + pad * 2;
-    let mut image = vec![0u8; (width * height) as usize];
-    let cells = bytes_to_cells(bytes);
-    for row in 0..STRIP_ROWS as u32 {
-        for col in 0..STRIP_COLS as u32 {
-            if cells[row as usize * STRIP_COLS + col as usize] {
-                for dy in 0..cell {
-                    for dx in 0..cell {
-                        let x = pad + col * cell + dx;
-                        let y = pad + row * cell + dy;
-                        image[(y * width + x) as usize] = 255;
-                    }
-                }
+/// Paint a frame into a synthetic screenshot at a given cell size and offset.
+fn paint(frame: &[u8], cell_px: u32, offset: (u32, u32), pad: u32) -> RgbImage {
+    let cells = bytes_to_cells(frame);
+    let rows = (cells.len() + CELLS_PER_ROW - 1) / CELLS_PER_ROW;
+    let width = CELLS_PER_ROW as u32 * cell_px + pad * 2 + offset.0;
+    let height = rows as u32 * cell_px + pad * 2 + offset.1;
+    let mut data = vec![0u8; (width * height * 3) as usize];
+
+    for (index, &value) in cells.iter().enumerate() {
+        let (r, g, b) = cell_color(value);
+        let (cr, cg, cb) = ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
+        let column = index % CELLS_PER_ROW;
+        let row = index / CELLS_PER_ROW;
+        for dy in 0..cell_px {
+            for dx in 0..cell_px {
+                let x = pad + offset.0 + column as u32 * cell_px + dx;
+                let y = pad + offset.1 + row as u32 * cell_px + dy;
+                let at = ((y * width + x) * 3) as usize;
+                data[at] = cr;
+                data[at + 1] = cg;
+                data[at + 2] = cb;
             }
         }
     }
-    (image, width, height)
-}
-
-#[test]
-fn prompt_survives_the_pixel_channel() {
-    let prompt = "what quest am I on? context: zone Elwynn Forest, level 12";
-    let fragment = &prompt.as_bytes()[..40.min(prompt.len())];
-    let frame = PromptFrame {
-        ui_session: 4242,
-        request_id: 7,
-        fragment_index: 0,
-        fragment_count: 1,
-        flags: 0,
-        payload: fragment.to_vec(),
-    };
-    let bytes = frame.encode();
-
-    let (image, width, height) = paint(&bytes, 4, 12);
-    let gray = GrayImage::new(width, height, &image);
-    let view = gray.sub(12, 12, STRIP_COLS as u32 * 4, STRIP_ROWS as u32 * 4);
-    let decoded = decode_strip(&view, 4).expect("frame decodes");
-    assert_eq!(decoded, bytes);
-
-    let round_tripped = PromptFrame::decode(&decoded).expect("frame parses");
-    assert_eq!(round_tripped, frame);
-}
-
-#[test]
-fn control_frame_survives_the_pixel_channel() {
-    let frame = ControlFrame {
-        ui_session: 1,
-        request_id: 99,
-        requested_fragment: 2,
-        slot: 512,
-        deadline_ms: 1500,
-        state: reply_state::WORKING,
-        active: true,
-        last_attempted_slot: 511,
-    };
-    let bytes = frame.encode();
-    let (image, width, height) = paint(&bytes, 6, 0);
-    let gray = GrayImage::new(width, height, &image);
-    let decoded = decode_strip(&gray, 6).expect("frame decodes");
-    assert_eq!(ControlFrame::decode(&decoded).unwrap(), frame);
-}
-
-#[test]
-fn reply_survives_the_font_channel() {
-    let reply = ReplyFrame {
-        state: reply_state::DONE,
-        ui_session: 4242,
-        request_id: 7,
-        fragment_index: 1,
-        fragment_count: 1,
-        revision: 0xABCD_1234,
-        slot: 33,
-        flags: 0,
-        payload: b"Here is the answer: kill 10 wolves, then return to Goldshire.".to_vec(),
-    };
-    let packet = reply.encode();
-    let font = build_reply_font(&packet);
-
-    // Mirror the Lua receiver: measure calibration glyphs and data glyphs,
-    // then normalise. The trailing glyph cancels, so it is omitted here.
-    let advances = read_advances(&font);
-    let low = advances[GLYPH_CAL_LOW as usize];
-    let high = advances[GLYPH_CAL_HIGH as usize];
-    assert_eq!(low, ADVANCE_BASE);
-    assert_eq!(high, ADVANCE_BASE + 16 * 255);
-
-    let mut recovered = [0u8; DATA_GLYPHS];
-    for (i, slot) in recovered.iter_mut().enumerate() {
-        let read = advances[GLYPH_DATA_BASE as usize + i];
-        *slot = ocw::fonts::decode_byte(low, high, read);
+    RgbImage {
+        width,
+        height,
+        data,
     }
+}
 
-    assert_eq!(&recovered[..], &packet[..]);
-    assert_eq!(ReplyFrame::decode(&recovered).unwrap(), reply);
+/// Mirror of the addon's `Codec.Record`.
+fn addon_record(fields: &[&str]) -> String {
+    fields.join("\u{1f}")
 }
 
 #[test]
-fn long_reply_fragments_reassemble() {
-    // Simulate a reply longer than one font packet.
-    let text: String = "The quick brown fox jumps over the lazy dog. ".repeat(30);
-    let bytes = text.as_bytes();
-    let chunk = ocw::protocol::frames::REPLY_PAYLOAD_MAX;
-    let total = (bytes.len() + chunk - 1) / chunk;
+fn a_prompt_survives_the_pixel_strip() {
+    let record = addon_record(&["sess1", "2", "7", "", "", "Chat 2", "what quest am I on?"]);
+    let frame = encode_frame(4242, record.as_bytes());
 
-    let mut assembled = String::new();
-    for index in 0..total {
-        let start = index * chunk;
-        let end = (start + chunk).min(bytes.len());
-        let frame = ReplyFrame {
-            state: reply_state::DONE,
-            ui_session: 1,
-            request_id: 1,
-            fragment_index: (index + 1) as u16,
-            fragment_count: total as u16,
-            revision: 1,
-            slot: index as u16 + 1,
-            flags: 0,
-            payload: bytes[start..end].to_vec(),
-        };
-        let packet = frame.encode();
-        let font = build_reply_font(&packet);
-        let advances = read_advances(&font);
-        let low = advances[GLYPH_CAL_LOW as usize];
-        let high = advances[GLYPH_CAL_HIGH as usize];
-        let mut recovered = [0u8; DATA_GLYPHS];
-        for (i, slot) in recovered.iter_mut().enumerate() {
-            *slot = ocw::fonts::decode_byte(low, high, advances[GLYPH_DATA_BASE as usize + i]);
-        }
-        let decoded = ReplyFrame::decode(&recovered).unwrap();
-        assembled.push_str(&String::from_utf8_lossy(&decoded.payload));
-    }
+    let image = paint(&frame, 4, (61, 23), 12);
+    let location = find_strip(&image).expect("strip found");
+    assert_eq!(location.cell_px, 4);
 
-    assert_eq!(assembled, text);
+    let cells = sample_strip(&image, &location);
+    let (id, payload) = decode_frame(&bytes_to_cells_round_trip(&cells)).unwrap();
+    assert_eq!(id, 4242);
+
+    let records = Record::parse_all(&payload);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].tab, 2);
+    assert_eq!(records[0].request, 7);
+    assert_eq!(records[0].session, "sess1");
+    assert_eq!(records[0].text, "what quest am I on?");
+}
+
+fn bytes_to_cells_round_trip(cells: &[u8]) -> Vec<u8> {
+    ocw::protocol::strip::cells_to_bytes(cells)
+}
+
+#[test]
+fn several_records_fit_in_one_frame() {
+    let first = addon_record(&["s", "1", "1", "", "", "Chat 1", "first"]);
+    let second = addon_record(&["s", "1", "2", "", "c", "Chat 1", "zone: Elwynn", "second"]);
+    let payload = format!("{first}\u{1e}{second}");
+    let frame = encode_frame(9, payload.as_bytes());
+
+    let image = paint(&frame, 4, (0, 0), 0);
+    let location = find_strip(&image).unwrap();
+    let cells = sample_strip(&image, &location);
+    let (_, decoded) = decode_frame(&bytes_to_cells_round_trip(&cells)).unwrap();
+
+    let records = Record::parse_all(&decoded);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].context.as_deref(), Some("zone: Elwynn"));
+    assert_eq!(records[1].text, "second");
+}
+
+#[test]
+fn utf8_survives_the_strip() {
+    let text = "Warcraft: Ærøskøbing 🐉";
+    let record = addon_record(&["s", "1", "1", "", "", "Chat", text]);
+    let frame = encode_frame(1, record.as_bytes());
+    let image = paint(&frame, 4, (0, 0), 0);
+    let location = find_strip(&image).unwrap();
+    let cells = sample_strip(&image, &location);
+    let (_, payload) = decode_frame(&bytes_to_cells_round_trip(&cells)).unwrap();
+    let records = Record::parse_all(&payload);
+    assert_eq!(records[0].text, text);
+}
+
+#[test]
+fn the_magic_is_what_calibration_looks_for() {
+    // Every frame starts with the same colours, which is how the strip is found.
+    let cells = bytes_to_cells(&MAGIC);
+    assert_eq!(cells, vec![0b110, 0b001, 0b110, 0b001, 0b101, 0b000]);
+}
+
+#[test]
+fn slot_data_renders_as_loadable_lua() {
+    let data = SlotData {
+        now: 1_700_000_000,
+        seq: 12,
+        replies: vec![
+            Reply {
+                tab: 1,
+                request: 3,
+                status: ReplyStatus::Done,
+                text: "first line\nsecond \"quoted\" line".to_string(),
+                session: "ses_abc".to_string(),
+                denied: vec!["Bash(rm:*)".to_string()],
+            },
+            Reply {
+                tab: 2,
+                request: 4,
+                status: ReplyStatus::Working,
+                text: String::new(),
+                session: String::new(),
+                denied: Vec::new(),
+            },
+        ],
+    };
+    let lua = render_slot(&data);
+    assert!(lua.starts_with("-- generated"));
+    assert!(lua.contains("OCWow_SlotData = {"));
+    assert!(lua.contains("now = 1700000000"));
+    assert!(lua.contains("tab = 1"));
+    assert!(lua.contains("status = \"done\""));
+    // Quotes and newlines must be escaped so the file stays valid Lua.
+    assert!(lua.contains(r#"first line\nsecond \"quoted\" line"#));
+    assert!(lua.contains(r#"denied = {"Bash(rm:*)"}"#));
+    assert!(lua.ends_with("}\n"));
+}
+
+#[test]
+fn long_replies_are_carried_whole() {
+    // Slot files have no size limit, unlike the old font channel.
+    let text: String = "The quick brown fox jumps over the lazy dog. ".repeat(200);
+    let data = SlotData {
+        now: 1,
+        seq: 1,
+        replies: vec![Reply {
+            tab: 1,
+            request: 1,
+            status: ReplyStatus::Done,
+            text: text.clone(),
+            session: "s".to_string(),
+            denied: Vec::new(),
+        }],
+    };
+    let lua = render_slot(&data);
+    assert!(lua.contains(&text));
 }

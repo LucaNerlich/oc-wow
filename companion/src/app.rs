@@ -1,67 +1,61 @@
 //! The companion's main loop: decode the pixel strip, run prompts on a worker
-//! thread, and serve replies back through the font bank.
+//! thread, and publish replies through the load-on-demand slot bank.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
 use crate::backend::opencode::ModelRef;
 use crate::backend::{AskRequest, Backend};
-use crate::capture::Capturer;
-use crate::config::Config;
+use crate::capture::{find_strip, sample_strip, Capturer, Region, StripLocation};
+use crate::config::{Config, StripSettings};
 use crate::context;
-use crate::fonts::Bank;
 use crate::git;
-use crate::protocol::adler32::adler32;
-use crate::protocol::frames::{
-    self, reply_state, ControlFrame, PromptFrame, ReplyFrame, OUT_TYPE_CONTROL, OUT_TYPE_PROMPT,
-};
-use crate::protocol::pixel::{self, GrayImage, BYTES_PER_FRAME, STRIP_COLS};
-use crate::state::{find_wow_pid, State};
-
-/// Bytes of reply text carried by one font packet.
-const REPLY_CHUNK: usize = frames::REPLY_PAYLOAD_MAX;
+use crate::protocol::strip::{self, StripError};
+use crate::slots::{Reply, ReplyStatus, SlotBank, SlotData};
 
 /// How often the strip is sampled.
-const DEFAULT_POLL_MS: u64 = 120;
+const DEFAULT_POLL_MS: u64 = 250;
+/// How often slot data is published even when nothing changed.
+const PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+/// Margin, in points, added around the strip when caching its screen rectangle.
+const REGION_MARGIN: i32 = 24;
 
 /// Runtime state shared with the worker thread.
 #[derive(Default)]
 struct Shared {
-    session_id: Mutex<Option<String>>,
+    /// One OpenCode session per tab.
+    sessions: Mutex<HashMap<u8, String>>,
     model: Mutex<Option<ModelRef>>,
-    last_error: Mutex<Option<String>>,
 }
 
 /// Status of a single in-flight request.
 #[derive(Debug, Clone)]
 pub struct JobStatus {
-    pub state: u8,
+    pub status: ReplyStatus,
     pub payload: String,
-    pub revision: u32,
-    pub error: Option<String>,
+    pub session: String,
 }
 
 impl Default for JobStatus {
     fn default() -> Self {
         Self {
-            state: reply_state::QUEUED,
+            status: ReplyStatus::Working,
             payload: String::new(),
-            revision: 0,
-            error: None,
+            session: String::new(),
         }
     }
 }
 
 /// A unit of work handed to the worker thread.
 struct Job {
-    ui_session: u16,
-    request_id: u32,
+    tab: u8,
+    request: u32,
     text: String,
     context: Option<String>,
     project: Option<PathBuf>,
@@ -71,109 +65,152 @@ struct Job {
 /// Messages the main loop can send to the worker.
 enum WorkerMsg {
     Ask(Box<Job>),
-    Interrupt,
-    SetModel(String),
-    NewSession,
+    Interrupt(u8),
+    SetModel { tab: u8, spec: String },
+    NewSession(u8),
+    CloseSession(u8),
 }
 
-/// Reassembly buffer for a multi-fragment prompt.
-struct Partial {
-    fragments: Vec<Option<Vec<u8>>>,
+/// One record decoded from the strip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    pub session: String,
+    pub tab: u8,
+    pub request: u32,
+    pub cwd: String,
+    pub flags: String,
+    pub name: String,
+    pub context: Option<String>,
+    pub text: String,
 }
 
-impl Partial {
-    fn new(count: u16) -> Self {
-        Self {
-            fragments: vec![None; count.max(1) as usize],
-        }
+impl Record {
+    pub fn is_hello(&self) -> bool {
+        self.flags.contains('h')
     }
 
-    fn ensure_len(&mut self, count: u16) {
-        let want = count.max(1) as usize;
-        if self.fragments.len() != want {
-            self.fragments.resize(want, None);
-        }
+    pub fn is_delete(&self) -> bool {
+        self.flags.contains('d')
     }
 
-    fn is_complete(&self) -> bool {
-        self.fragments.iter().all(|f| f.is_some())
+    pub fn starts_new_session(&self) -> bool {
+        self.flags.contains('n')
     }
 
-    fn join(&self) -> String {
-        let mut bytes = Vec::new();
-        for fragment in &self.fragments {
-            if let Some(chunk) = fragment {
-                bytes.extend_from_slice(chunk);
-            }
+    /// Split a decoded payload into records.
+    pub fn parse_all(payload: &[u8]) -> Vec<Record> {
+        strip::parse_records(payload)
+            .into_iter()
+            .filter_map(|fields| Record::from_fields(&fields))
+            .collect()
+    }
+
+    fn from_fields(fields: &[Vec<u8>]) -> Option<Record> {
+        // session, tab, request, cwd, flags, name, [context,] text
+        if fields.len() < 7 {
+            return None;
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        let text_of = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        let flags = text_of(&fields[4]);
+        let has_context = flags.split(';').any(|f| f == "c");
+        let context = if has_context && fields.len() >= 8 {
+            Some(text_of(&fields[6]))
+        } else {
+            None
+        };
+        let text_start = if has_context { 7 } else { 6 };
+        let text = fields[text_start..]
+            .iter()
+            .map(|f| text_of(f))
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+
+        Some(Record {
+            session: text_of(&fields[0]),
+            tab: text_of(&fields[1]).parse().ok()?,
+            request: text_of(&fields[2]).parse().ok()?,
+            cwd: text_of(&fields[3]),
+            flags,
+            name: text_of(&fields[5]),
+            context,
+            text,
+        })
     }
 }
 
 /// The companion application.
 pub struct App {
     config: Config,
-    config_path: PathBuf,
-    bank: Bank,
+    bank: SlotBank,
     capturer: Capturer,
-    state: State,
-    state_path: PathBuf,
-    jobs: Arc<Mutex<HashMap<u64, Arc<Mutex<JobStatus>>>>>,
+    strip: Option<StripSettings>,
+    jobs: Arc<Mutex<HashMap<JobKey, Arc<Mutex<JobStatus>>>>>,
     shared: Arc<Shared>,
     worker_tx: Option<Sender<WorkerMsg>>,
     worker_rx: Option<Receiver<WorkerMsg>>,
     worker: Option<JoinHandle<()>>,
     backend: Option<Backend>,
-    partial: HashMap<u64, Partial>,
-    last_written: HashMap<u16, u32>,
     project: Option<PathBuf>,
+    seen: HashSet<u32>,
+    signaled: HashSet<(u8, u32)>,
+    slot_seq: u64,
+    last_published: String,
+    last_publish: Instant,
     verbose: bool,
     poll_ms: u64,
+}
+
+/// Stable key for a `(tab, request)` pair.
+pub type JobKey = (u8, u32);
+
+pub fn job_key(tab: u8, request: u32) -> JobKey {
+    (tab, request)
+}
+
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl App {
     /// Build the application, reconciling state against the running client.
     pub fn new(config: Config, backend: Backend, verbose: bool) -> Result<Self> {
-        let bank = config.bank();
-        let capturer = Capturer::new(
-            config.capture.region(),
-            config.capture.command.clone(),
-            config.capture.cell_px,
-        );
-        let state_path = crate::state::default_state_path();
-        let mut state = State::load(&state_path).unwrap_or_default();
-        if state.observe_client(find_wow_pid()) {
-            eprintln!("[ocw] detected a new WoW client process; will reset the addon slot counter");
-        }
+        let bank = config.slot_bank();
+        let capturer = Capturer::new(config.capture.command.clone());
+        let strip = config.capture.strip;
 
         let (worker_tx, worker_rx) = mpsc::channel();
 
         Ok(Self {
             project: config.opencode.project.clone(),
-            config_path: crate::config::default_config_path(),
             config,
             bank,
             capturer,
-            state,
-            state_path,
+            strip,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             shared: Arc::new(Shared::default()),
             worker_tx: Some(worker_tx),
             worker_rx: Some(worker_rx),
             worker: None,
             backend: Some(backend),
-            partial: HashMap::new(),
-            last_written: HashMap::new(),
+            seen: HashSet::new(),
+            signaled: HashSet::new(),
+            slot_seq: 0,
+            last_published: String::new(),
+            last_publish: Instant::now(),
             verbose,
             poll_ms: DEFAULT_POLL_MS,
         })
     }
 
-    /// Validate that the font bank is installed before running.
-    pub fn check_bank(&self) -> Result<()> {        if !self.bank.is_installed() {
+    /// Validate that the slots are installed before running.
+    pub fn check_slots(&self) -> Result<()> {
+        if !self.bank.is_installed() {
             anyhow::bail!(
-                "font bank not installed at {}; run `ocw install` first",
-                self.bank.dir().display()
+                "slot addons not installed under {}; run `ocw install` first",
+                self.bank.addons_dir().display()
             );
         }
         Ok(())
@@ -184,12 +221,6 @@ impl App {
         self.poll_ms = ms.max(20);
     }
 
-    /// Set the configuration file used to persist calibration results.
-    pub fn set_config_path(&mut self, path: PathBuf) {
-        self.config_path = path;
-    }
-
-    /// Start the worker thread without entering the capture loop.
     pub fn start(&mut self) -> Result<()> {
         if self.worker.is_some() {
             return Ok(());
@@ -197,6 +228,16 @@ impl App {
         let backend = self.backend.take().context("backend already moved")?;
         let worker_rx = self.worker_rx.take().context("worker already started")?;
         let shared = Arc::clone(&self.shared);
+
+        // Make the effective model explicit, so `/ocw status` and `/model` report
+        // what the server would have used anyway.
+        if shared.model.lock().unwrap().is_none() {
+            if let Some(model) = backend.default_model() {
+                eprintln!("[ocw] using the server's default model: {}", model.label());
+                *shared.model.lock().unwrap() = Some(model);
+            }
+        }
+
         let model = self.config.opencode.model.clone();
         self.worker = Some(thread::spawn(move || {
             worker_loop(backend, worker_rx, shared, model);
@@ -204,7 +245,6 @@ impl App {
         Ok(())
     }
 
-    /// Signal the worker to finish and join it.
     pub fn stop(&mut self) {
         self.worker_tx = None;
         if let Some(handle) = self.worker.take() {
@@ -212,39 +252,26 @@ impl App {
         }
     }
 
-    /// Feed a decoded frame into the bridge. Used by the self-test harness.
+    /// Feed a decoded strip payload into the bridge. Used by the self-test.
     #[doc(hidden)]
-    pub fn ingest_frame(&mut self, bytes: &[u8; BYTES_PER_FRAME]) {
-        self.handle_frame(bytes);
+    pub fn ingest(&mut self, id: u32, payload: &[u8]) {
+        self.handle_payload(id, payload);
     }
 
-    /// The font bank in use.
     #[doc(hidden)]
-    pub fn bank(&self) -> &Bank {
-        &self.bank
+    pub fn slot_data(&self) -> SlotData {
+        self.build_slot_data()
     }
 
-    /// Current state of a request, for diagnostics and tests.
     #[doc(hidden)]
-    pub fn job_state(&self, ui_session: u16, request_id: u32) -> Option<u8> {
-        let key = job_key(ui_session, request_id);
-        self.jobs
-            .lock()
-            .unwrap()
-            .get(&key)
-            .map(|status| status.lock().unwrap().state)
+    pub fn session_ids(&self) -> HashMap<u8, String> {
+        self.shared.sessions.lock().unwrap().clone()
     }
 
-    /// Backend description for the self-test banner.
+    /// Backend description, for banners and tests.
     #[doc(hidden)]
     pub fn describe(&self) -> String {
         self.backend_description()
-    }
-
-    /// The session the backend is currently bound to.
-    #[doc(hidden)]
-    pub fn session_id(&self) -> Option<String> {
-        self.shared.session_id.lock().unwrap().clone()
     }
 
     fn log(&self, message: &str) {
@@ -253,79 +280,28 @@ impl App {
         }
     }
 
-    /// Start the worker thread and run the main loop for `duration`.
+    /// Run the read loop for `duration`.
     pub fn run(&mut self, duration: Option<Duration>) -> Result<()> {
-        self.auto_calibrate();
         self.start()?;
         let result = self.main_loop(duration);
         self.stop();
         result
     }
 
-    /// Best-effort one-shot calibration: if the configured crop does not decode
-    /// cleanly, search the capture for the strip and adopt what is found.
-    pub fn auto_calibrate(&mut self) {
-        let image = match self.capturer.capture() {
-            Ok(image) => image,
-            Err(err) => {
-                eprintln!("[ocw] calibration skipped: {err}");
-                return;
-            }
-        };
-        let gray = image.as_gray();
-
-        if let Some(bytes) = decode_any(&gray, self.config.capture.cell_px) {
-            if pixel::is_valid_frame(&bytes) {
-                self.log("configured crop decodes cleanly");
-                return;
-            }
-        }
-
-        match pixel::find_strip(&gray) {
-            Some((cell, dx, dy, _)) => {
-                let region = self.config.capture.region();
-                self.config.capture.x = region.x + dx as i32;
-                self.config.capture.y = region.y + dy as i32;
-                self.config.capture.width = STRIP_COLS as u32 * cell;
-                self.config.capture.height = pixel::STRIP_ROWS as u32 * cell;
-                self.config.capture.cell_px = 0;
-                self.capturer = Capturer::new(
-                    self.config.capture.region(),
-                    self.config.capture.command.clone(),
-                    0,
-                );
-                eprintln!(
-                    "[ocw] auto-calibrated: cell={cell}px, crop {},{},{},{}",
-                    self.config.capture.x,
-                    self.config.capture.y,
-                    self.config.capture.width,
-                    self.config.capture.height
-                );
-                // Remember the crop so later runs start calibrated.
-                if let Err(err) = self.config.save(&self.config_path) {
-                    eprintln!("[ocw] could not save calibration: {err}");
-                } else {
-                    eprintln!("[ocw] saved to {}", self.config_path.display());
-                }
-            }
-            None => eprintln!(
-                "[ocw] warning: strip not found in the capture; run `ocw probe` \
-                 (and `/ocw calibrate` in game)"
-            ),
-        }
-    }
-
     fn main_loop(&mut self, duration: Option<Duration>) -> Result<()> {
         let started = Instant::now();
-        let mut capture_errors = 0u32;
-        let mut frames = 0u64;
+        let mut errors = 0u32;
+        let mut decoded = 0u64;
 
         eprintln!(
-            "[ocw] serving: bank={} slots at {}, backend={}, crop={:?}",
+            "[ocw] serving: {} slots under {}, backend={}, strip={}",
             self.bank.slots(),
-            self.bank.dir().display(),
+            self.bank.addons_dir().display(),
             self.backend_description(),
-            self.config.capture.region()
+            match &self.strip {
+                Some(s) => format!("{}x{} at {},{}", s.width, s.height, s.x, s.y),
+                None => "not calibrated (will search the screen)".to_string(),
+            }
         );
         eprintln!("[ocw] press Ctrl-C to stop");
 
@@ -336,33 +312,33 @@ impl App {
                 }
             }
 
-            match self.capturer.capture() {
-                Ok(image) => {
-                    capture_errors = 0;
-                    if let Some(bytes) = decode_any(&image.as_gray(), self.config.capture.cell_px) {
-                        frames += 1;
-                        self.handle_frame(&bytes);
+            match self.poll_strip() {
+                Ok(found) => {
+                    errors = 0;
+                    if found {
+                        decoded += 1;
                     }
                 }
                 Err(err) => {
-                    capture_errors += 1;
-                    if capture_errors <= 3 || capture_errors % 50 == 0 {
-                        eprintln!("[ocw] capture failed ({capture_errors}): {err}");
-                        if capture_errors == 3 {
+                    errors += 1;
+                    if errors <= 3 || errors % 100 == 0 {
+                        eprintln!("[ocw] capture failed ({errors}): {err}");
+                        if errors == 3 {
                             eprintln!(
                                 "[ocw] hint: grant Screen Recording permission to your terminal, \
-                                 and check the crop in `ocw probe`"
+                                 and make sure WoW is windowed or borderless"
                             );
                         }
                     }
-                    thread::sleep(Duration::from_millis(400));
+                    thread::sleep(Duration::from_millis(500));
                 }
             }
 
+            self.maybe_publish();
             thread::sleep(Duration::from_millis(self.poll_ms));
         }
 
-        eprintln!("[ocw] stopped after decoding {frames} frames");
+        eprintln!("[ocw] stopped after {decoded} decoded frames");
         Ok(())
     }
 
@@ -382,66 +358,133 @@ impl App {
         }
     }
 
-    fn handle_frame(&mut self, bytes: &[u8; BYTES_PER_FRAME]) {
-        match bytes[2] {
-            OUT_TYPE_PROMPT => match PromptFrame::decode(bytes) {
-                Ok(frame) => self.on_prompt(frame),
-                Err(err) => self.log(&format!("bad prompt frame: {err}")),
-            },
-            OUT_TYPE_CONTROL => match ControlFrame::decode(bytes) {
-                Ok(frame) => self.on_control(frame),
-                Err(err) => self.log(&format!("bad control frame: {err}")),
-            },
-            other => self.log(&format!("unknown frame type {other}")),
+    /// Capture once and try to decode a frame. Returns whether one was read.
+    fn poll_strip(&mut self) -> Result<bool> {
+        let region = match self.strip {
+            Some(settings) => settings.region(),
+            None => Region::full(),
+        };
+
+        let image = self.capturer.capture(region)?;
+        let location = match find_strip(&image) {
+            Some(location) => location,
+            None => {
+                if self.strip.is_some() {
+                    // The cached rectangle is stale; look again next time.
+                    self.log("strip not found in the cached region; recalibrating");
+                    self.strip = None;
+                }
+                return Ok(false);
+            }
+        };
+
+        if self.strip.is_none() {
+            self.cache_strip(&image, &location);
+        }
+
+        let cells = sample_strip(&image, &location);
+        let bytes = strip::cells_to_bytes(&cells);
+        match strip::decode_frame(&bytes) {
+            Ok((id, payload)) => {
+                let id = id as u32;
+                if self.seen.contains(&id) {
+                    return Ok(false);
+                }
+                self.seen.insert(id);
+                if self.seen.len() > 4096 {
+                    self.seen.clear();
+                }
+                let _ = self.bank.signal_ack(id);
+                self.log(&format!("strip frame {id}: {} bytes", payload.len()));
+                self.handle_payload(id, &payload);
+                Ok(true)
+            }
+            Err(StripError::BadMagic) => Ok(false),
+            Err(err) => {
+                self.log(&format!("strip seen but rejected: {err}"));
+                Ok(false)
+            }
         }
     }
 
-    fn on_prompt(&mut self, frame: PromptFrame) {
-        let key = job_key(frame.ui_session, frame.request_id);
-        let partial = self.partial.entry(key).or_insert_with(|| Partial::new(frame.fragment_count));
-        partial.ensure_len(frame.fragment_count);
+    /// Turn a strip location in image pixels into a screen rectangle in points.
+    fn cache_strip(&mut self, image: &crate::capture::RgbImage, location: &StripLocation) {
+        let scale = match self.capturer.point_scale() {
+            Ok(scale) if scale > 0.0 => scale,
+            _ => 1.0,
+        };
+        let to_points = |value: u32| (value as f64 / scale).round() as i32;
 
-        if (frame.fragment_index as usize) < partial.fragments.len() {
-            partial.fragments[frame.fragment_index as usize] = Some(frame.payload.clone());
+        // The full-screen capture starts at the screen origin, so image pixels
+        // map directly onto points once divided by the scale.
+        let origin_x = to_points(location.x);
+        let origin_y = to_points(location.y);
+        let settings = StripSettings {
+            x: origin_x - REGION_MARGIN,
+            y: origin_y - REGION_MARGIN,
+            width: to_points(location.width()) as u32 + (REGION_MARGIN as u32) * 2,
+            height: to_points(location.height(strip::MAX_ROWS)) as u32 + (REGION_MARGIN as u32) * 2,
+        };
+        eprintln!(
+            "[ocw] strip found: cell {}px, screen {},{} (capturing {}x{} points)",
+            location.cell_px, origin_x, origin_y, settings.width, settings.height
+        );
+        let _ = image;
+        self.strip = Some(settings);
+        self.config.capture.strip = Some(settings);
+    }
+
+    fn handle_payload(&mut self, id: u32, payload: &[u8]) {
+        for record in Record::parse_all(payload) {
+            if record.is_hello() {
+                self.log(&format!("hello from tab {} (session {})", record.tab, record.session));
+                self.publish_now();
+                continue;
+            }
+            if record.is_delete() {
+                self.log(&format!("tab {} deleted", record.tab));
+                self.send(WorkerMsg::CloseSession(record.tab));
+                self.jobs.lock().unwrap().retain(|key, _| key.0 != record.tab);
+                continue;
+            }
+            self.on_prompt(id, record);
         }
+    }
 
-        if !partial.is_complete() {
-            return;
-        }
-
-        let text = partial.join();
-        self.partial.remove(&key);
-
+    fn on_prompt(&mut self, id: u32, record: Record) {
+        let key = job_key(record.tab, record.request);
         if self.jobs.lock().unwrap().contains_key(&key) {
             return;
         }
 
         self.log(&format!(
-            "request {} (session {}): {} bytes",
-            frame.request_id,
-            frame.ui_session,
-            text.len()
+            "tab {} request {} (strip {id}): {} bytes",
+            record.tab,
+            record.request,
+            record.text.len()
         ));
-        self.start_job(key, frame.ui_session, frame.request_id, text);
+        self.start_job(key, record);
     }
 
-    fn start_job(&mut self, key: u64, ui_session: u16, request_id: u32, text: String) {
+    fn start_job(&mut self, key: JobKey, record: Record) {
         let status = Arc::new(Mutex::new(JobStatus::default()));
-        self.jobs
-            .lock()
-            .unwrap()
-            .insert(key, Arc::clone(&status));
+        self.jobs.lock().unwrap().insert(key, Arc::clone(&status));
+
+        if record.starts_new_session() {
+            self.send(WorkerMsg::NewSession(record.tab));
+        }
 
         // Local slash-commands are answered without touching the backend.
-        if let Some(reply) = self.local_command(&text) {
+        if let Some(reply) = self.local_command(record.tab, &record.text) {
             let mut guard = status.lock().unwrap();
-            guard.state = reply_state::DONE;
+            guard.status = ReplyStatus::Done;
             guard.payload = reply;
-            guard.revision = revision_of(guard.state, &guard.payload);
+            drop(guard);
+            self.publish_now();
             return;
         }
 
-        let (user_text, game_state) = context::split_game_state(&text);
+        let (user_text, game_state) = context::split_game_state(&record.text);
         let git_summary = self.project.as_deref().and_then(git::summarize);
         let ctx = context::compose(
             &self.backend_description(),
@@ -451,19 +494,18 @@ impl App {
         );
 
         let job = Job {
-            ui_session,
-            request_id,
+            tab: record.tab,
+            request: record.request,
             text: user_text,
             context: Some(ctx),
             project: self.project.clone(),
             status,
         };
-        if let Some(tx) = &self.worker_tx {
-            let _ = tx.send(WorkerMsg::Ask(Box::new(job)));
-        }
+        self.send(WorkerMsg::Ask(Box::new(job)));
+        self.publish_now();
     }
 
-    fn local_command(&mut self, text: &str) -> Option<String> {
+    fn local_command(&mut self, tab: u8, text: &str) -> Option<String> {
         let trimmed = text.trim();
         if !trimmed.starts_with('/') {
             return None;
@@ -478,30 +520,31 @@ impl App {
                 "commands: /help /stop /new /model <provider/model> /status".to_string(),
             ),
             "/stop" | "/interrupt" => {
-                self.send(WorkerMsg::Interrupt);
-                Some("interrupt requested".to_string())
+                self.send(WorkerMsg::Interrupt(tab));
+                Some(format!("interrupt requested for tab {tab}"))
             }
             "/new" => {
-                self.send(WorkerMsg::NewSession);
-                Some("new session started".to_string())
+                self.send(WorkerMsg::NewSession(tab));
+                Some(format!("new session started for tab {tab}"))
             }
             "/model" => {
                 if arg.is_empty() {
-                    return Some(format!(
-                        "current model: {}",
-                        self.backend_description()
-                    ));
+                    return Some(format!("current model: {}", self.backend_description()));
                 }
-                self.send(WorkerMsg::SetModel(arg.to_string()));
+                self.send(WorkerMsg::SetModel {
+                    tab,
+                    spec: arg.to_string(),
+                });
                 Some(format!("model set to {arg}"))
             }
             "/status" => {
                 let session = self
                     .shared
-                    .session_id
+                    .sessions
                     .lock()
                     .unwrap()
-                    .clone()
+                    .get(&tab)
+                    .cloned()
                     .unwrap_or_else(|| "none".to_string());
                 let project = self
                     .project
@@ -509,8 +552,7 @@ impl App {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "none".to_string());
                 Some(format!(
-                    "backend: {}\nsession: {session}\nproject: {project}\nmodel: {}",
-                    "opencode",
+                    "backend: opencode\ntab: {tab}\nsession: {session}\nproject: {project}\nmodel: {}",
                     self.backend_description()
                 ))
             }
@@ -518,80 +560,78 @@ impl App {
         }
     }
 
-    fn on_control(&mut self, control: ControlFrame) {
-        // A detected client restart rewinds the addon's slot counter.
-        if self.state.pending_reset {
-            let frame = ReplyFrame {
-                state: reply_state::RESET,
-                ui_session: control.ui_session,
-                request_id: control.request_id,
-                fragment_index: 1,
-                fragment_count: 1,
-                revision: 1,
-                slot: control.slot,
-                flags: 0,
-                payload: b"reset".to_vec(),
-            };
-            let _ = self.bank.publish_reply(control.slot, &frame.encode());
-            if control.slot <= 2 {
-                self.state.pending_reset = false;
-                let _ = self.state.save(&self.state_path);
-            }
-            return;
-        }
-
-        let key = job_key(control.ui_session, control.request_id);
-        let (state, payload, revision) = {
-            let jobs = self.jobs.lock().unwrap();
-            match jobs.get(&key) {
-                Some(status) => {
-                    let guard = status.lock().unwrap();
-                    (guard.state, guard.payload.clone(), guard.revision)
+    /// Build the slot payload from the current job states.
+    fn build_slot_data(&self) -> SlotData {
+        let jobs = self.jobs.lock().unwrap();
+        let mut replies: Vec<Reply> = jobs
+            .iter()
+            .map(|(key, status)| {
+                let guard = status.lock().unwrap();
+                Reply {
+                    tab: key.0,
+                    request: key.1,
+                    status: guard.status,
+                    text: guard.payload.clone(),
+                    session: guard.session.clone(),
+                    denied: Vec::new(),
                 }
-                None => (reply_state::WAITING, String::new(), 0),
-            }
-        };
-
-        let count = fragment_count(payload.len());
-        let mut index = control.requested_fragment;
-        if index < 1 || index > count {
-            index = 1;
+            })
+            .collect();
+        replies.sort_by_key(|reply| (reply.tab, reply.request));
+        SlotData {
+            now: now_epoch(),
+            seq: self.slot_seq,
+            replies,
         }
-        let chunk = fragment_at(&payload, index);
+    }
 
-        let frame = ReplyFrame {
-            state,
-            ui_session: control.ui_session,
-            request_id: control.request_id,
-            fragment_index: index,
-            fragment_count: count,
-            revision,
-            slot: control.slot,
-            flags: 0,
-            payload: chunk,
-        };
-        let encoded = frame.encode();
+    /// Publish slot data now, and raise a readiness signal for anything new.
+    fn publish_now(&mut self) {
+        self.slot_seq += 1;
+        let data = self.build_slot_data();
+        let body = crate::slots::render_slot(&data);
 
-        let fingerprint = adler32(&encoded[..60]);
-        if self.last_written.get(&control.slot) == Some(&fingerprint) {
+        for reply in &data.replies {
+            if reply.status != ReplyStatus::Working
+                && self.signaled.insert((reply.tab, reply.request))
+            {
+                if let Err(err) = self.bank.signal_reply(reply.request) {
+                    eprintln!("[ocw] could not raise reply signal: {err}");
+                }
+            }
+        }
+
+        if body == self.last_published {
             return;
         }
-
-        match self.bank.publish_reply(control.slot, &encoded) {
+        match self.bank.publish(&data) {
             Ok(()) => {
-                self.last_written.insert(control.slot, fingerprint);
-                self.log(&format!(
-                    "wrote {} fragment {index}/{count} to slot {}",
-                    reply_state::name(state),
-                    control.slot
-                ));
+                self.log(&format!("published {} replies", data.replies.len()));
+                self.last_published = body;
+                self.last_publish = Instant::now();
             }
-            Err(err) => eprintln!("[ocw] failed to write slot {}: {err}", control.slot),
+            Err(err) => eprintln!("[ocw] publish failed: {err}"),
+        }
+    }
+
+    /// Publish on a timer so the addon's status light stays honest.
+    fn maybe_publish(&mut self) {
+        if self.last_publish.elapsed() >= PUBLISH_INTERVAL {
+            self.slot_seq += 1;
+            let data = self.build_slot_data();
+            let body = crate::slots::render_slot(&data);
+            if body != self.last_published {
+                if let Err(err) = self.bank.publish(&data) {
+                    eprintln!("[ocw] publish failed: {err}");
+                } else {
+                    self.last_published = body;
+                }
+            }
+            self.last_publish = Instant::now();
         }
     }
 }
 
-/// Owns the backend inside the worker thread.
 fn worker_loop(
     mut backend: Backend,
     rx: Receiver<WorkerMsg>,
@@ -606,16 +646,10 @@ fn worker_loop(
         match message {
             WorkerMsg::Ask(job) => {
                 let status = Arc::clone(&job.status);
-                {
-                    let mut guard = status.lock().unwrap();
-                    guard.state = reply_state::WORKING;
-                    guard.revision = revision_of(guard.state, &guard.payload);
-                }
-
-                let session = shared.session_id.lock().unwrap().clone();
+                let session = shared.sessions.lock().unwrap().get(&job.tab).cloned();
                 let request = AskRequest {
-                    ui_session: job.ui_session,
-                    request_id: job.request_id,
+                    tab: job.tab,
+                    request_id: job.request,
                     text: job.text,
                     context: job.context,
                     project: job.project,
@@ -625,77 +659,48 @@ fn worker_loop(
 
                 match backend.ask(&request) {
                     Ok(response) => {
-                        if let Some(session) = &response.session_id {
-                            *shared.session_id.lock().unwrap() = Some(session.clone());
-                        }
                         let mut guard = status.lock().unwrap();
-                        guard.state = reply_state::DONE;
+                        if let Some(session) = &response.session_id {
+                            shared
+                                .sessions
+                                .lock()
+                                .unwrap()
+                                .insert(job.tab, session.clone());
+                            guard.session = session.clone();
+                        }
+                        guard.status = ReplyStatus::Done;
                         guard.payload = response.text;
-                        guard.revision = revision_of(guard.state, &guard.payload);
-                        *shared.last_error.lock().unwrap() = None;
                     }
                     Err(err) => {
-                        let message = err.to_string();
                         let mut guard = status.lock().unwrap();
-                        guard.state = reply_state::FAILED;
-                        guard.payload = format!("error: {message}");
-                        guard.error = Some(message.clone());
-                        guard.revision = revision_of(guard.state, &guard.payload);
-                        *shared.last_error.lock().unwrap() = Some(message);
+                        guard.status = ReplyStatus::Error;
+                        guard.payload = format!("error: {err}");
                     }
                 }
             }
-            WorkerMsg::Interrupt => {
-                if let Some(session) = shared.session_id.lock().unwrap().clone() {
+            WorkerMsg::Interrupt(tab) => {
+                if let Some(session) = shared.sessions.lock().unwrap().get(&tab).cloned() {
                     let _ = backend.interrupt(&session);
                 }
             }
-            WorkerMsg::SetModel(spec) => {
+            WorkerMsg::SetModel { tab, spec } => {
                 let parsed = ModelRef::parse(&spec);
-                *shared.model.lock().unwrap() = parsed;
+                *shared.model.lock().unwrap() = parsed.clone();
+                // Apply it to the session that asked, so the change is immediate
+                // rather than only affecting the next new session.
+                if let (Some(model), Some(session)) = (
+                    parsed,
+                    shared.sessions.lock().unwrap().get(&tab).cloned(),
+                ) {
+                    if let Err(err) = backend.switch_model(&session, &model) {
+                        eprintln!("[ocw] could not switch model for tab {tab}: {err}");
+                    }
+                }
             }
-            WorkerMsg::NewSession => {
-                *shared.session_id.lock().unwrap() = None;
+            WorkerMsg::NewSession(tab) | WorkerMsg::CloseSession(tab) => {
+                shared.sessions.lock().unwrap().remove(&tab);
             }
         }
-    }
-}
-
-/// Stable key for a `(ui_session, request_id)` pair.
-pub fn job_key(ui_session: u16, request_id: u32) -> u64 {
-    ((ui_session as u64) << 32) | request_id as u64
-}
-
-/// Number of fragments needed for a payload.
-pub fn fragment_count(len: usize) -> u16 {
-    ((len + REPLY_CHUNK - 1) / REPLY_CHUNK).max(1) as u16
-}
-
-/// Extract the 1-based fragment `index` from a payload.
-pub fn fragment_at(payload: &str, index: u16) -> Vec<u8> {
-    let bytes = payload.as_bytes();
-    let start = (index.saturating_sub(1) as usize) * REPLY_CHUNK;
-    if start >= bytes.len() {
-        return Vec::new();
-    }
-    bytes[start..(start + REPLY_CHUNK).min(bytes.len())].to_vec()
-}
-
-/// A content-derived revision so the addon can discard partial assemblies.
-fn revision_of(state: u8, payload: &str) -> u32 {
-    (adler32(payload.as_bytes()) ^ (state as u32)).max(1)
-}
-
-/// Decode one frame, auto-detecting the cell size when `hint` is zero.
-fn decode_any(image: &GrayImage, hint: u32) -> Option<[u8; BYTES_PER_FRAME]> {
-    if hint > 0 {
-        return pixel::decode_strip(image, hint);
-    }
-    let auto = image.width / STRIP_COLS as u32;
-    if auto == 0 {
-        None
-    } else {
-        pixel::decode_strip(image, auto)
     }
 }
 
@@ -703,38 +708,45 @@ fn decode_any(image: &GrayImage, hint: u32) -> Option<[u8; BYTES_PER_FRAME]> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fragments_split_and_count() {
-        let payload = "a".repeat(REPLY_CHUNK + 10);
-        assert_eq!(fragment_count(payload.len()), 2);
-        assert_eq!(fragment_at(&payload, 1).len(), REPLY_CHUNK);
-        assert_eq!(fragment_at(&payload, 2).len(), 10);
-        assert!(fragment_at(&payload, 3).is_empty());
+    fn record(fields: &[&str]) -> Option<Record> {
+        let owned: Vec<Vec<u8>> = fields.iter().map(|f| f.as_bytes().to_vec()).collect();
+        Record::from_fields(&owned)
     }
 
     #[test]
-    fn empty_payload_is_one_fragment() {
-        assert_eq!(fragment_count(0), 1);
+    fn parses_a_plain_record() {
+        let parsed = record(&["sess", "2", "7", "", "", "Chat", "hello there"]).unwrap();
+        assert_eq!(parsed.session, "sess");
+        assert_eq!(parsed.tab, 2);
+        assert_eq!(parsed.request, 7);
+        assert_eq!(parsed.text, "hello there");
+        assert!(parsed.context.is_none());
     }
 
     #[test]
-    fn partial_reassembly() {
-        let mut partial = Partial::new(2);
-        partial.fragments[0] = Some(b"hello ".to_vec());
-        assert!(!partial.is_complete());
-        partial.fragments[1] = Some(b"world".to_vec());
-        assert!(partial.is_complete());
-        assert_eq!(partial.join(), "hello world");
+    fn parses_a_context_record() {
+        let parsed = record(&["s", "1", "3", "", "c", "Chat", "zone: Elwynn", "the prompt"]).unwrap();
+        assert_eq!(parsed.context.as_deref(), Some("zone: Elwynn"));
+        assert_eq!(parsed.text, "the prompt");
     }
 
     #[test]
-    fn revision_changes_with_content() {
-        assert_ne!(revision_of(reply_state::DONE, "a"), revision_of(reply_state::DONE, "b"));
-        assert_ne!(revision_of(reply_state::DONE, "a"), revision_of(reply_state::WORKING, "a"));
+    fn recognises_flags() {
+        let hello = record(&["s", "1", "1", "", "h", "Chat", "x"]).unwrap();
+        assert!(hello.is_hello() && !hello.is_delete());
+        let deleted = record(&["s", "1", "1", "", "d", "Chat", ""]).unwrap();
+        assert!(deleted.is_delete());
+        let fresh = record(&["s", "1", "1", "", "n;c", "Chat", "ctx", "x"]).unwrap();
+        assert!(fresh.starts_new_session());
     }
 
     #[test]
-    fn job_key_is_unique() {
+    fn rejects_short_records() {
+        assert!(record(&["s", "1"]).is_none());
+    }
+
+    #[test]
+    fn job_keys_are_unique() {
         assert_ne!(job_key(1, 1), job_key(1, 2));
         assert_ne!(job_key(1, 1), job_key(2, 1));
     }

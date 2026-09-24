@@ -2,12 +2,11 @@
 ## Title: OCWow
 ## Notes: Drive OpenCode from inside World of Warcraft
 ## Author: oc-wow
-## Version: 0.1.0
+## Version: 0.2.0
 ## SavedVariables: OCWowDB
 ## X-Category: Chat & Communication
 
-Protocol.lua
-Native.lua
+Codec.lua
 Context.lua
 UI.lua
 Main.lua

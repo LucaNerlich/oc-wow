@@ -1,508 +1,865 @@
 --[[
 OCWow :: Main
 
-Wires everything together: the pixel strip, the font-metric receiver, the UI,
-slash commands, and the request lifecycle.
+Wires the transport, the tabbed UI and the request lifecycle together.
 
-Sending a prompt:
-  1. transmit phase - the prompt is split into 40-byte fragments and painted on
-     the strip, a few passes so a missed capture can recover.
-  2. receive phase - control frames advertise the font slot the addon is about
-     to load and the reply fragment it wants; after the advertised window the
-     slot is loaded and measured.
-  3. replies are assembled by fragment index and displayed when complete.
+  * OUT: a message is drawn as a strip of coloured cells in the top-left of the
+    game window; the companion screen-captures that corner and decodes it.
+  * IN: the companion writes the latest state of every chat into a bank of
+    load-on-demand addons; we load a fresh one and read the global it defines.
+  * Signals: `PlaySoundFile` reports whether a file will play, so a pre-made
+    empty `.wav` is a one-shot flag the companion raises and we poll for free.
 
-Font slots are consumed monotonically and remembered in SavedVariables, because
-the client caches a font after its first load in a given process.
+Each tab is an independent OpenCode session with its own transcript.
 ]]
 
-local _, ns = ...
-local OCWow = ns or OCWow
-local P = OCWow.Protocol
-local N = OCWow.Native
-local C = OCWow.Context
-local U = OCWow.UI
+local ADDON_NAME, ns = ...
+-- Every file must use the addon namespace table (`...`), not the global: the
+-- files that set fields on it shadow the global, so reading `OCWow` here would
+-- see an empty table.
+local OCWow = ns
+if type(OCWow) ~= "table" then
+	print("OCWow: the addon namespace table is missing; check the TOC file order")
+	return
+end
+_G.OCWow = OCWow
 
-local M = {}
-OCWow.Main = M
+local Codec = OCWow.Codec
+if type(Codec) ~= "table" then
+	print("OCWow: Codec.lua did not load; check the TOC file order")
+	return
+end
 
-local TRANSMIT_INTERVAL = 0.25
-local RECEIVE_INTERVAL = 0.30
+local DEFAULT_CWD = ""
+local MAX_TABS = 8
 
---- Font-bank size created by `ocw install`.
-local BANK_SIZE = 4096
+local SLOT_COUNT = 200
+local SLOT_PREFIX = "OCWow_S"
+local STRIP_TRIES = 3
+local STRIP_SECONDS = 40
+local TICK_SECONDS = 2
+local POLL_SCHEDULE = { 5, 10, 16, 24, 34, 46, 60, 80, 100, 130, 160, 200, 240, 300 }
+local POLL_TAIL = 60
 
--- Defaults so the module never nil-indexes, even if SavedVariables are absent
--- (a fresh install has no OCWowDB file) or ADDON_LOADED was somehow missed.
-local db = {
-	next_slot = 1,
-	context_tier = C.TIER_LIGHT,
-	include_context = true,
-	transport_enabled = true,
-}
-local initialized = false
-local strip
-local ticker
-local accum = 0
+local CELL = Codec.CELL_PX
+local CELLS_PER_ROW = Codec.CELLS_PER_ROW
+local MAX_ROWS = Codec.MAX_ROWS
+local RS, US = Codec.RECORD_SEP, Codec.FIELD_SEP
 
-local state = {
-	ui_session = 0,
-	next_request_id = 1,
-	pending = nil,
-	calibrating = false,
-	context_tier = C.TIER_LIGHT,
-	include_context = true,
-}
+local db
+local ui = {}
+-- Transport state for this UI session: outbound[id] = { tab, flags, text, sentAt, acked }
+local run = { outbound = {} }
 
-local TIER_NAMES = { "light", "normal", "full" }
+---------------------------------------------------------------------------
+-- Helpers
+---------------------------------------------------------------------------
 
-function M.init()
-	if initialized then
-		return
+local function Trim(s)
+	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function FmtDur(sec)
+	sec = math.floor(sec or 0)
+	if sec < 60 then
+		return sec .. "s"
 	end
-	initialized = true
+	return math.floor(sec / 60) .. "m" .. string.format("%02d", sec % 60) .. "s"
+end
 
-	-- The client does not pre-create the SavedVariables table, and it will even
-	-- persist `OCWowDB = nil` if the global was nil at logout, so recover from
-	-- any non-table value rather than just nil.
+local function LoadAddOn(name)
+	if C_AddOns and C_AddOns.LoadAddOn then
+		return C_AddOns.LoadAddOn(name)
+	end
+	if LoadAddOn then
+		return LoadAddOn(name)
+	end
+end
+
+local function IsAddOnLoaded(name)
+	if C_AddOns and C_AddOns.IsAddOnLoaded then
+		return C_AddOns.IsAddOnLoaded(name)
+	end
+	if IsAddOnLoaded then
+		return IsAddOnLoaded(name)
+	end
+	return false
+end
+
+local function SlotName(index)
+	return string.format("%s%03d", SLOT_PREFIX, index)
+end
+
+local function SlotNumber(id)
+	return ((id - 1) % SLOT_COUNT) + 1
+end
+
+local function NewId()
+	return string.format("%x%04x%04x", time() % 0xFFFFFF, math.floor(GetTime() * 1000) % 0xFFFF, math.floor(GetTime() * 1000000) % 0xFFFF)
+end
+
+local function InitDB()
 	if type(OCWowDB) ~= "table" then
 		OCWowDB = {}
 	end
 	db = OCWowDB
-
-	if not db.next_slot or db.next_slot < 1 then
-		db.next_slot = 1
+	if not db.seq then
+		db.seq = 0
 	end
-	if db.context_tier == nil then
-		db.context_tier = C.TIER_LIGHT
+	if type(db.tab_labels) ~= "table" then
+		db.tab_labels = {}
 	end
-	if db.include_context == nil then
-		db.include_context = true
+	if not db.tab_count or db.tab_count < 1 then
+		db.tab_count = 1
 	end
-	if db.transport_enabled == nil then
-		db.transport_enabled = true
+	if db.tab_count > MAX_TABS then
+		db.tab_count = MAX_TABS
 	end
-
-	-- Some client builds omit `math.randomseed`, and an unseeded `math.random`
-	-- repeats the same sequence every session, so derive the session id from the
-	-- clock instead of the RNG.
-	local clock = (time() or 0) * 1000 + math.floor((GetTime() or 0) * 1000)
-	state.ui_session = (clock % 65535) + 1
-	state.context_tier = db.context_tier
-	state.include_context = db.include_context
+	if db.context == nil then
+		db.context = true
+	end
+	if db.contextTier == nil then
+		db.contextTier = OCWow.Context.TIER_LIGHT
+	end
+	if db.transport == nil then
+		db.transport = true
+	end
+	if not db.session then
+		db.session = NewId()
+	end
 end
 
-function M.setup()
-	-- Idempotent: guarantees db and the session id even if ADDON_LOADED was
-	-- missed, since PLAYER_LOGIN always fires.
-	M.init()
+---------------------------------------------------------------------------
+-- The pixel strip (out)
+---------------------------------------------------------------------------
 
-	strip = P.create_strip(UIParent)
-	N.init(UIParent)
-	if not db.transport_enabled then
+local strip
+local cellPool = {}
+
+local function EnsureStrip()
+	if strip then
+		return strip
+	end
+	strip = CreateFrame("Frame", "OCWowStrip", UIParent)
+	strip:SetFrameStrata("TOOLTIP")
+	strip:SetFrameLevel(10000)
+	-- Scale so that one UI unit is exactly one physical pixel (Blizzard's
+	-- PixelUtil trick), so the strip is a fixed size on screen regardless of the
+	-- player's UI scale.
+	local physicalHeight = 1080
+	if GetPhysicalScreenSize then
+		local _, height = GetPhysicalScreenSize()
+		physicalHeight = height or physicalHeight
+	end
+	if strip.SetIgnoreParentScale then
+		strip:SetIgnoreParentScale(true)
+	end
+	strip:SetScale(768 / physicalHeight)
+	strip:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 0, 0)
+	strip:SetSize(CELLS_PER_ROW * CELL, MAX_ROWS * CELL)
+	strip:Hide()
+	return strip
+end
+
+local function HideStrip()
+	if strip then
 		strip:Hide()
 	end
-	U.create(M.send_prompt)
-	U.set_context_tier(state.context_tier)
-	U.on_context_click = M.cycle_context
-
-	ticker = CreateFrame("Frame")
-	ticker:SetScript("OnUpdate", function(_, dt)
-		accum = accum + dt
-		local interval = RECEIVE_INTERVAL
-		local pending = state.pending
-		if pending and pending.active and pending.phase == "transmit" then
-			interval = TRANSMIT_INTERVAL
-		end
-		if accum >= interval then
-			accum = 0
-			M.tick()
-		end
-	end)
-
-	U.add("OCWow ready. /ocw to toggle, /ocw calibrate if the companion cannot find the strip.", 0.7, 0.9, 0.7)
 end
 
--- ---------------------------------------------------------------------------
--- The strip ticker
--- ---------------------------------------------------------------------------
+local function ShowStrip(id, payload)
+	local cells = Codec.EncodeFrame(id % 65536, payload)
+	local rows = math.ceil(#cells / CELLS_PER_ROW)
+	local total = rows * CELLS_PER_ROW
+	local frame = EnsureStrip()
 
-function M.tick()
-	if not db.transport_enabled then
-		return
-	end
-	if state.calibrating then
-		P.render_strip(strip, P.idle_frame(state.ui_session))
-		return
-	end
-	local pending = state.pending
-	if not pending or not pending.active then
-		P.render_strip(strip, P.idle_frame(state.ui_session))
-		return
-	end
-	if pending.phase == "transmit" then
-		M.tick_transmit(pending)
-	else
-		M.tick_receive(pending)
-	end
-end
-
-function M.tick_transmit(pending)
-	if pending.frag_index <= #pending.fragments then
-		local fragment = pending.fragments[pending.frag_index]
-		P.render_strip(
-			strip,
-			P.encode_prompt(
-				state.ui_session,
-				pending.request_id,
-				pending.frag_index - 1,
-				#pending.fragments,
-				fragment
-			)
-		)
-		pending.frag_index = pending.frag_index + 1
-		return
-	end
-
-	pending.frag_index = 1
-	pending.pass = pending.pass + 1
-
-	local passes = 1
-	if #pending.fragments <= 4 then
-		passes = 3
-	elseif #pending.fragments <= 12 then
-		passes = 2
-	end
-
-	if pending.pass >= passes then
-		pending.phase = "receive"
-		pending.ticks = 0
-		pending.wait_ticks = 4
-		U.set_status("waiting for reply...")
-	end
-end
-
-function M.tick_receive(pending)
-	if pending.reading then
-		return
-	end
-
-	-- Re-send a prompt fragment occasionally so a missed frame still starts the job.
-	pending.resend = (pending.resend or 0) + 1
-	if pending.resend % 12 == 0 and #pending.fragments > 0 then
-		pending.resend_index = ((pending.resend_index or 0) % #pending.fragments) + 1
-		P.render_strip(
-			strip,
-			P.encode_prompt(
-				state.ui_session,
-				pending.request_id,
-				pending.resend_index - 1,
-				#pending.fragments,
-				pending.fragments[pending.resend_index]
-			)
-		)
-		return
-	end
-
-	if pending.ticks < pending.wait_ticks then
-		P.render_strip(
-			strip,
-			P.encode_control(
-				state.ui_session,
-				pending.request_id,
-				pending.req_fragment,
-				pending.slot,
-				pending.wait_ticks * 250,
-				P.STATE.WORKING,
-				1,
-				pending.last_slot or 0
-			)
-		)
-		pending.ticks = pending.ticks + 1
-		return
-	end
-
-	local slot = pending.slot
-	pending.last_slot = slot
-	pending.slot = slot + 1
-	db.next_slot = pending.slot
-	pending.ticks = 0
-	pending.reading = true
-
-	if slot > BANK_SIZE then
-		U.add("font bank exhausted; restart the game client and the companion", 1, 0.5, 0.3)
-		M.finish(pending)
-		return
-	end
-
-	N.request(slot, function(packet, reason)
-		M.on_reply(pending, packet, reason)
-	end)
-end
-
--- ---------------------------------------------------------------------------
--- Replies
--- ---------------------------------------------------------------------------
-
-function M.on_reply(pending, packet, reason)
-	pending.reading = false
-	if not pending.active then
-		return
-	end
-
-	if not packet then
-		pending.stale = (pending.stale or 0) + 1
-		if pending.stale >= 10 then
-			local detail = N.last_calibration and (" [" .. N.last_calibration .. "]") or ""
-			U.add(
-				"transport stalled ("
-					.. tostring(reason)
-					.. ")"
-					.. detail
-					.. ". Is the companion running, and the strip visible and unobscured?",
-				1,
-				0.5,
-				0.3
-			)
-			M.finish(pending)
+	for i = 1, total do
+		local texture = cellPool[i]
+		if not texture then
+			texture = frame:CreateTexture(nil, "OVERLAY")
+			texture:SetSize(CELL, CELL)
+			local column = (i - 1) % CELLS_PER_ROW
+			local row = math.floor((i - 1) / CELLS_PER_ROW)
+			texture:SetPoint("TOPLEFT", frame, "TOPLEFT", column * CELL, -row * CELL)
+			cellPool[i] = texture
 		end
-		return
+		local r, g, b = Codec.CellColor(cells[i] or 0)
+		texture:SetColorTexture(r, g, b, 1)
+		texture:Show()
 	end
-
-	pending.stale = 0
-
-	if packet.state == P.STATE.RESET then
-		db.next_slot = 1
-		pending.slot = 1
-		pending.req_fragment = 1
-		pending.parts = {}
-		pending.wait_ticks = 4
-		U.set_status("transport reset")
-		return
+	for i = total + 1, #cellPool do
+		cellPool[i]:Hide()
 	end
-
-	if packet.state == P.STATE.DONE or packet.state == P.STATE.FAILED then
-		if pending.last_revision and pending.last_revision ~= packet.revision then
-			pending.parts = {}
-		end
-		pending.last_revision = packet.revision
-		pending.parts[packet.fragment_index] = packet.payload
-
-		if packet.fragment_index < packet.fragment_count then
-			pending.req_fragment = packet.fragment_index + 1
-			pending.wait_ticks = 4
-			U.set_status(string.format("receiving %d/%d...", packet.fragment_index, packet.fragment_count))
-			return
-		end
-
-		local text = table.concat(pending.parts, "")
-		if packet.state == P.STATE.FAILED then
-			U.add("opencode: " .. text, 1, 0.5, 0.4)
-		else
-			U.add("opencode: " .. text, 0.7, 1, 0.75)
-		end
-		M.finish(pending)
-		return
-	end
-
-	-- queued / working / streaming
-	U.set_status(P.STATE_NAME[packet.state] or "working")
-	pending.wait_ticks = math.min(pending.wait_ticks * 2, 20)
-	pending.ticks = 0
+	frame:Show()
 end
 
-function M.finish(pending)
-	pending.active = false
-	state.pending = nil
-	U.set_status("ready")
+--- Redraw the strip from every outbound message the companion hasn't acknowledged.
+local function RefreshStrip()
+	local ids = {}
+	for id, record in pairs(run.outbound) do
+		if not record.acked then
+			ids[#ids + 1] = id
+		end
+	end
+	if #ids == 0 then
+		HideStrip()
+		return
+	end
+	table.sort(ids)
+
+	local parts, size = {}, 0
+	local latest = ids[#ids]
+	for i = #ids, 1, -1 do
+		local record = run.outbound[ids[i]]
+		local fields = {
+			db.session,
+			tostring(record.tab),
+			tostring(ids[i]),
+			record.cwd or "",
+			record.flags or "",
+			record.name or "",
+		}
+		if record.ctx ~= nil then
+			fields[5] = (fields[5] == "" and "c") or (fields[5] .. ";c")
+			fields[#fields + 1] = record.ctx
+		end
+		fields[#fields + 1] = record.text
+		local encoded = table.concat(fields, US):gsub("[" .. RS .. US .. "]", " ")
+		if size + #encoded + 1 > Codec.MAX_PAYLOAD then
+			break
+		end
+		table.insert(parts, 1, encoded)
+		size = size + #encoded + 1
+	end
+	ShowStrip(latest, table.concat(parts, RS))
 end
 
--- ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
+-- Signals and slots (in)
+---------------------------------------------------------------------------
+
+local signalAvailable = type(PlaySoundFile) == "function"
+
+local function SoundValid(path)
+	if not signalAvailable then
+		return false
+	end
+	local ok, willPlay, handle = pcall(PlaySoundFile, path, "Master")
+	if not ok then
+		signalAvailable = false
+		return false
+	end
+	if willPlay and handle then
+		pcall(StopSound, handle)
+	end
+	return willPlay and true or false
+end
+
+local function SignalPath(kind, index)
+	return string.format("Interface\\AddOns\\OCWow\\%s\\%03d.wav", kind, index)
+end
+
+local function CheckSignal(kind, id)
+	return SoundValid(SignalPath(kind, SlotNumber(id)))
+end
+
+--- Prove the sound channel distinguishes empty from valid files on this client.
+local function SelfTestSignals()
+	if not signalAvailable then
+		return
+	end
+	local emptyLooksValid = SoundValid("Interface\\AddOns\\OCWow\\ctl\\empty.wav")
+	local validLooksValid = SoundValid("Interface\\AddOns\\OCWow\\ctl\\valid.wav")
+	if emptyLooksValid or not validLooksValid then
+		signalAvailable = false
+	end
+end
+
+local function FreeSlot()
+	for i = 1, SLOT_COUNT do
+		local name = SlotName(i)
+		if not IsAddOnLoaded(name) then
+			return name
+		end
+	end
+end
+
+local function ScheduleNextPoll()
+	local index = (run.polls or 0) + 1
+	local seconds = POLL_SCHEDULE[index]
+	if not seconds then
+		seconds = POLL_SCHEDULE[#POLL_SCHEDULE] + POLL_TAIL * (index - #POLL_SCHEDULE)
+	end
+	run.nextPollAt = (run.sentAt or GetTime()) + seconds
+end
+
+local function FindTab(id)
+	for _, tab in pairs(run.tabs or {}) do
+		if tab.id == id then
+			return tab
+		end
+	end
+end
+
+local Finish -- forward declaration
+
+local function ApplyReplies(replies)
+	for _, reply in ipairs(replies or {}) do
+		local tab = FindTab(reply.tab)
+		if tab and tab.pendingId == reply.request then
+			if reply.status == "done" then
+				Finish(tab, "opencode", reply.text or "")
+			elseif reply.status == "error" then
+				Finish(tab, "system", "Bridge error: " .. tostring(reply.text))
+			else
+				tab.progress = reply.text
+			end
+		end
+	end
+end
+
+local function TryLoadSlot(why)
+	local name = FreeSlot()
+	if not name then
+		run.slotsExhausted = true
+		return
+	end
+	OCWow_SlotData = nil
+	local loaded = LoadAddOn(name)
+	if not loaded then
+		run.slotsMissing = true
+		return
+	end
+	run.polls = (run.polls or 0) + 1
+	ScheduleNextPoll()
+	local data = OCWow_SlotData
+	if type(data) == "table" then
+		if type(data.now) == "number" then
+			run.bridgeSeen = GetTime() - (time() - data.now)
+		end
+		ApplyReplies(data.replies)
+	end
+	if why == "signal" and run.signalUnreliable == nil then
+		run.signalUnreliable = false
+	end
+	OCWow.Render()
+end
+
+---------------------------------------------------------------------------
 -- Sending
--- ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
 
-function M.send_prompt(text)
-	text = text and text:match("^%s*(.-)%s*$") or ""
+local function ContextToSend(room)
+	local text = db.context and OCWow.Context.snapshot(db.contextTier) or ""
+	if text == (run.contextSent or "") then
+		return nil
+	end
+	if room and #text > room then
+		return nil
+	end
+	return text
+end
+
+function OCWow.Send(text, newSession)
+	local tab = OCWow.ActiveTab()
+	if not tab then
+		return
+	end
+	text = Trim(text or "")
 	if text == "" then
 		return
 	end
-
-	if not db.transport_enabled then
-		U.add("transport is off; use /ocw transport on to enable", 1, 0.6, 0.3)
+	if tab.pendingId then
+		OCWow.AddHistory(tab, "system", "This tab is still waiting for a reply.")
+		OCWow.Render()
+		return
+	end
+	if not db.transport then
+		OCWow.AddHistory(tab, "system", "Transport is off (/ocw transport on).")
+		OCWow.Render()
 		return
 	end
 
-	local pending = state.pending
-	if pending and pending.active then
-		U.add("a request is already in flight; wait or use /ocw stop", 1, 0.6, 0.3)
+	local limit = Codec.MAX_PAYLOAD - 400
+	if #text > limit then
+		OCWow.AddHistory(tab, "system", "That message is too long (" .. #text .. " > " .. limit .. " bytes).")
+		OCWow.Render()
 		return
 	end
 
-	local is_command = text:sub(1, 1) == "/"
-	local body = text
-	if state.include_context and not is_command then
-		local snapshot = C.snapshot(state.context_tier)
-		if snapshot and snapshot ~= "" then
-			body = text .. "\n\n" .. P.CONTEXT_OPEN .. "\n" .. snapshot .. "\n" .. P.CONTEXT_CLOSE
+	local context = ContextToSend(limit - #text)
+
+	db.seq = db.seq + 1
+	local id = db.seq
+	local flags = {}
+	if newSession or tab.newSession then
+		flags[#flags + 1] = "n"
+		tab.newSession = nil
+	end
+
+	run.outbound[id] = {
+		tab = tab.id,
+		cwd = tab.cwd or DEFAULT_CWD,
+		flags = table.concat(flags, ";"),
+		name = tab.label,
+		ctx = context,
+		text = text,
+		sentAt = GetTime(),
+	}
+	tab.pendingId = id
+	tab.draft = nil
+	run.sentAt = GetTime()
+	run.polls = 0
+	ScheduleNextPoll()
+	OCWow.AddHistory(tab, "user", text, id)
+	RefreshStrip()
+	OCWow.Render()
+end
+
+--- A record with no text that just announces this session token, so the
+--- companion can ack, refresh the slots and offer a restore.
+function OCWow.SayHello()
+	if not db or not db.transport then
+		return
+	end
+	db.seq = db.seq + 1
+	local tab = OCWow.ActiveTab()
+	run.outbound[db.seq] = {
+		tab = tab and tab.id or 0,
+		cwd = tab and tab.cwd or "",
+		flags = "h",
+		name = tab and tab.label or "",
+		ctx = db.context and OCWow.Context.snapshot(db.contextTier) or "",
+		text = "",
+		sentAt = GetTime(),
+		hello = true,
+	}
+	RefreshStrip()
+	OCWow.Render()
+end
+
+--- Put the active tab's pending message back on the strip.
+function OCWow.Resend()
+	local tab = OCWow.ActiveTab()
+	if not tab or not tab.pendingId then
+		return
+	end
+	local text
+	for i = #tab.history, 1, -1 do
+		if tab.history[i].id == tab.pendingId then
+			text = tab.history[i].text
+			break
 		end
 	end
+	if not text then
+		return
+	end
+	run.outbound[tab.pendingId] = {
+		tab = tab.id,
+		cwd = tab.cwd or "",
+		flags = "",
+		name = tab.label,
+		text = text,
+		sentAt = GetTime(),
+	}
+	run.sentAt = GetTime()
+	run.polls = 0
+	ScheduleNextPoll()
+	RefreshStrip()
+	OCWow.Render()
+end
 
-	if #body > P.MAX_PROMPT_BYTES then
-		U.add(string.format("prompt too long (%d > %d bytes)", #body, P.MAX_PROMPT_BYTES), 1, 0.4, 0.4)
+---------------------------------------------------------------------------
+-- Tabs
+---------------------------------------------------------------------------
+
+function OCWow.EnsureTab(id, label)
+	run.tabs = run.tabs or {}
+	local tab = run.tabs[id]
+	if not tab then
+		tab = {
+			id = id,
+			label = label or db.tab_labels[id] or tostring(id),
+			cwd = DEFAULT_CWD,
+			history = {},
+			pendingId = nil,
+			unread = 0,
+			created = time(),
+		}
+		run.tabs[id] = tab
+		ui.create_tab(id, tab.label)
+	end
+	return tab
+end
+
+function OCWow.ActiveTab()
+	run.tabs = run.tabs or {}
+	return run.tabs[run.activeTab or 1]
+end
+
+function OCWow.NewTab()
+	local id = 1
+	while run.tabs and run.tabs[id] do
+		id = id + 1
+	end
+	if id > MAX_TABS then
+		OCWow.AddHistory(OCWow.ActiveTab(), "system", "Tab limit reached (" .. MAX_TABS .. ").")
+		OCWow.Render()
+		return
+	end
+	OCWow.EnsureTab(id)
+	OCWow.SwitchTab(id)
+	db.tab_count = math.max(db.tab_count or 1, id)
+end
+
+function OCWow.SwitchTab(id)
+	if not run.tabs or not run.tabs[id] then
+		return
+	end
+	run.activeTab = id
+	ui.set_active_tab(id)
+	OCWow.Render()
+end
+
+function OCWow.CloseTab(id)
+	local tab = run.tabs and run.tabs[id]
+	if not tab then
+		return
+	end
+	if ui.tab_count() <= 1 then
+		OCWow.AddHistory(tab, "system", "Cannot close the last tab.")
+		OCWow.Render()
+		return
+	end
+	-- Tell the companion to forget this tab's session.
+	db.seq = db.seq + 1
+	run.outbound[db.seq] = {
+		tab = id,
+		cwd = tab.cwd or "",
+		flags = "d",
+		name = tab.label,
+		text = "",
+		sentAt = GetTime(),
+	}
+	RefreshStrip()
+
+	run.tabs[id] = nil
+	db.tab_labels[id] = nil
+	ui.close_tab(id)
+	if run.activeTab == id then
+		local ids = ui.tab_ids()
+		OCWow.SwitchTab(ids[1] or 1)
+	end
+end
+
+function OCWow.RenameTab(label)
+	local tab = OCWow.ActiveTab()
+	if not tab then
+		return
+	end
+	label = Trim(label or "")
+	if label == "" then
+		label = tostring(tab.id)
+	end
+	tab.label = label
+	db.tab_labels[tab.id] = label
+	ui.set_tab_label(tab.id, label)
+end
+
+local ROLE_STYLE = {
+	user = { prefix = "you: ", r = 0.7, g = 0.85, b = 1.0 },
+	opencode = { prefix = "opencode: ", r = 0.7, g = 1.0, b = 0.75 },
+	system = { prefix = "", r = 0.8, g = 0.8, b = 0.8 },
+}
+
+--- Append to a tab's history *and* its transcript, so the panel shows it.
+function OCWow.AddHistory(tab, role, text, id)
+	if not tab then
+		return
+	end
+	tab.history[#tab.history + 1] = { role = role, text = text, id = id, t = time() }
+	while #tab.history > 200 do
+		table.remove(tab.history, 1)
+	end
+
+	local style = ROLE_STYLE[role] or ROLE_STYLE.system
+	if ui and ui.add_to then
+		ui.add_to(tab.id, style.prefix .. tostring(text or ""), style.r, style.g, style.b)
+	end
+	if not (ui and ui.is_shown and ui.is_shown() and run.activeTab == tab.id) then
+		tab.unread = (tab.unread or 0) + 1
+		if ui and ui.set_tab_unread then
+			ui.set_tab_unread(tab.id, true)
+		end
+	end
+end
+
+Finish = function(tab, role, text)
+	OCWow.AddHistory(tab, role, text, tab.pendingId)
+	tab.pendingId = nil
+	tab.progress = nil
+	run.bridgeSeen = GetTime()
+	OCWow.Render()
+end
+
+---------------------------------------------------------------------------
+-- Ticking
+---------------------------------------------------------------------------
+
+function OCWow.Tick()
+	if not db then
+		return
+	end
+	local now = GetTime()
+
+	-- Acks: the companion read the message, so it can leave the strip.
+	local changed = false
+	for id, record in pairs(run.outbound) do
+		if not record.acked and CheckSignal("ack", id) then
+			record.acked = true
+			if record.ctx ~= nil then
+				run.contextSent = record.ctx
+			end
+			changed = true
+		end
+		if record.hello and not record.acked and run.bridgeSeen and run.bridgeSeen >= record.sentAt + 2 then
+			record.acked = true
+			changed = true
+		end
+		if record.acked then
+			run.outbound[id] = nil
+			changed = true
+		elseif record.hello and now - record.sentAt >= 20 then
+			run.outbound[id] = nil
+			changed = true
+		elseif now - record.sentAt >= STRIP_SECONDS then
+			record.tries = (record.tries or 1) + 1
+			if record.tries <= STRIP_TRIES then
+				record.sentAt = now
+				changed = true
+			else
+				run.outbound[id] = nil
+				run.pixelFailed = true
+				changed = true
+				local tab = FindTab(record.tab)
+				if tab then
+					OCWow.AddHistory(tab, "system", "The bridge didn't see that message. Is it running? (/ocw resend)")
+				end
+			end
+		end
+	end
+	if changed then
+		RefreshStrip()
+		OCWow.Render()
+	end
+
+	if not db.transport then
 		return
 	end
 
-	local fragments = P.fragment_prompt(body)
-	local request_id = state.next_request_id
-	state.next_request_id = request_id + 1
-
-	state.pending = {
-		active = true,
-		request_id = request_id,
-		fragments = fragments,
-		phase = "transmit",
-		frag_index = 1,
-		pass = 0,
-		slot = db.next_slot or 1,
-		req_fragment = 1,
-		parts = {},
-		ticks = 0,
-		wait_ticks = 4,
-		reading = false,
-		stale = 0,
-		resend = 0,
-	}
-
-	U.add("you: " .. text, 0.7, 0.85, 1)
-	U.set_status("sending...")
+	-- Readiness: load a slot as soon as a reply is ready, otherwise on schedule.
+	if run.nextPollAt and now >= run.nextPollAt then
+		TryLoadSlot("schedule")
+	end
+	for _, tab in pairs(run.tabs or {}) do
+		if tab.pendingId and CheckSignal("sig", tab.pendingId) then
+			TryLoadSlot("signal")
+			break
+		end
+	end
 end
 
-function M.cycle_context()
-	state.context_tier = (state.context_tier + 1) % 3
-	db.context_tier = state.context_tier
-	U.set_context_tier(state.context_tier)
-	U.add("game context: " .. TIER_NAMES[state.context_tier + 1], 0.8, 0.8, 0.8)
+---------------------------------------------------------------------------
+-- Rendering
+---------------------------------------------------------------------------
+
+function OCWow.Render()
+	if not ui.set_status then
+		return
+	end
+	local tab = OCWow.ActiveTab()
+	local parts = {}
+	if run.pixelFailed then
+		parts[#parts + 1] = "bridge not answering"
+	elseif run.slotsMissing then
+		parts[#parts + 1] = "slots missing (run ocw install)"
+	elseif run.slotsExhausted then
+		parts[#parts + 1] = "slot pool used up - /reload to free it"
+	end
+	if tab and tab.pendingId then
+		local elapsed = run.sentAt and (GetTime() - run.sentAt) or 0
+		parts[#parts + 1] = "working " .. FmtDur(elapsed)
+	end
+	if #parts == 0 then
+		parts[#parts + 1] = "ready"
+	end
+	ui.set_status(table.concat(parts, " - "))
 end
 
-function M.status_text()
-	return string.format(
-		"session %d, next request %d, next slot %d, context %s",
-		state.ui_session,
-		state.next_request_id,
-		db.next_slot or 1,
-		TIER_NAMES[state.context_tier + 1]
-	)
-end
-
--- ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
 -- Slash commands
--- ---------------------------------------------------------------------------
-
-local function set_calibrating(on)
-	state.calibrating = on
-	U.set_status(on and "calibrating: the strip is showing a fixed frame" or "ready")
-end
+---------------------------------------------------------------------------
 
 local COMMANDS = {
 	show = function()
-		U.show()
+		ui.show()
 	end,
 	hide = function()
-		U.hide()
+		ui.hide()
 	end,
 	toggle = function()
-		U.toggle()
+		ui.toggle()
+	end,
+	test = function()
+		OCWow.SayHello()
+		OCWow.AddHistory(OCWow.ActiveTab(), "system", "Strip shown for calibration; run `ocw probe` now.")
+		OCWow.Render()
+	end,
+	resend = function()
+		OCWow.Resend()
+	end,
+	newtab = function()
+		OCWow.NewTab()
+	end,
+	closetab = function()
+		OCWow.CloseTab(run.activeTab)
+	end,
+	tab = function(_, rest)
+		local id = tonumber(rest)
+		if id and run.tabs and run.tabs[id] then
+			OCWow.SwitchTab(id)
+		else
+			OCWow.AddHistory(OCWow.ActiveTab(), "system", "usage: /ocw tab <number>")
+		end
+	end,
+	rename = function(_, rest)
+		OCWow.RenameTab(rest)
 	end,
 	ctx = function()
-		M.cycle_context()
+		db.contextTier = (db.contextTier + 1) % 3
+		ui.set_context_tier(db.contextTier)
+		OCWow.AddHistory(OCWow.ActiveTab(), "system", "game context: " .. ({ "light", "normal", "full" })[db.contextTier + 1])
 	end,
-	calibrate = function()
-		set_calibrating(not state.calibrating)
-	end,
-	status = function()
-		U.add(M.status_text(), 0.85, 0.85, 0.85)
+	context = function(_, rest)
+		if rest == "off" then
+			db.context = false
+			run.contextSent = ""
+			OCWow.AddHistory(OCWow.ActiveTab(), "system", "context off")
+		elseif rest == "on" then
+			db.context = true
+			OCWow.AddHistory(OCWow.ActiveTab(), "system", "context on")
+		else
+			OCWow.AddHistory(OCWow.ActiveTab(), "system", "context: " .. (db.context and "on" or "off"))
+		end
 	end,
 	transport = function(_, rest)
 		if rest == "off" then
-			db.transport_enabled = false
-			if strip then
-				strip:Hide()
-			end
-			U.add("transport off: strip hidden, no font reads", 0.9, 0.8, 0.4)
+			db.transport = false
+			HideStrip()
+			OCWow.AddHistory(OCWow.ActiveTab(), "system", "transport off")
 		elseif rest == "on" then
-			db.transport_enabled = true
-			if strip then
-				strip:Show()
-			end
-			U.add("transport on", 0.7, 0.9, 0.7)
+			db.transport = true
+			OCWow.AddHistory(OCWow.ActiveTab(), "system", "transport on")
 		else
-			U.add("usage: /ocw transport on|off", 0.8, 0.8, 0.8)
+			OCWow.AddHistory(OCWow.ActiveTab(), "system", "transport: " .. (db.transport and "on" or "off"))
 		end
 	end,
-	context = function(_, rest)
-		if rest == "on" then
-			state.include_context = true
-			db.include_context = true
-			U.add("context: on", 0.8, 0.8, 0.8)
-		elseif rest == "off" then
-			state.include_context = false
-			db.include_context = false
-			U.add("context: off", 0.8, 0.8, 0.8)
-		else
-			U.add("usage: /ocw context on|off", 0.8, 0.8, 0.8)
-		end
+	status = function()
+		local tab = OCWow.ActiveTab()
+		local lines = {
+			"session " .. tostring(db.session),
+			"tab " .. tostring(tab and tab.id or "?") .. " (" .. tostring(tab and tab.label or "?") .. ")",
+			"next message id " .. tostring(db.seq),
+			"signal channel " .. (signalAvailable and "on" or "off"),
+			"slots missing " .. tostring(run.slotsMissing or false) .. ", exhausted " .. tostring(run.slotsExhausted or false),
+			"bridge seen " .. (run.bridgeSeen and FmtDur(GetTime() - run.bridgeSeen) .. " ago" or "never"),
+			"context " .. (db.context and ("on (" .. ({ "light", "normal", "full" })[db.contextTier + 1] .. ")") or "off"),
+			"transport " .. (db.transport and "on" or "off"),
+		}
+		OCWow.AddHistory(tab, "system", table.concat(lines, "\n"))
+		OCWow.Render()
 	end,
 }
 
-function M.slash(msg)
+function OCWow.Slash(msg)
 	msg = msg or ""
 	local command, rest = msg:match("^%s*(%S*)%s*(.-)%s*$")
 	command = (command or ""):lower()
 
 	if command == "" then
-		U.toggle()
+		ui.toggle()
 		return
 	end
-
 	local handler = COMMANDS[command]
 	if handler then
 		handler(command, rest)
+		OCWow.Render()
 		return
 	end
-
 	if command == "new" or command == "stop" or command == "help" or command == "model" then
-		M.send_prompt("/" .. command .. (rest ~= "" and (" " .. rest) or ""))
+		OCWow.Send("/" .. command .. (rest ~= "" and (" " .. rest) or ""))
 		return
 	end
-
-	M.send_prompt(msg)
+	OCWow.Send(msg)
 end
 
--- ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
 -- Bootstrap
--- ---------------------------------------------------------------------------
+---------------------------------------------------------------------------
 
-local function report_failure(stage, err)
+local function ReportFailure(stage, err)
 	local message = string.format("OCWow: %s failed: %s", stage, tostring(err))
 	print(message)
-	if U and U.add then
-		pcall(U.add, message, 1, 0.4, 0.4)
+	if ui and ui.add_to then
+		pcall(ui.add_to, run.activeTab or 1, message, 1, 0.4, 0.4)
 	end
+end
+
+function OCWow.Setup()
+	InitDB()
+	run.activeTab = 1
+	SelfTestSignals()
+	ui = OCWow.UI
+	ui.create({
+		on_send = function(text)
+			OCWow.Send(text)
+		end,
+		on_new_tab = OCWow.NewTab,
+		on_select_tab = OCWow.SwitchTab,
+	})
+	ui.set_context_tier(db.contextTier)
+
+	for id = 1, db.tab_count do
+		OCWow.EnsureTab(id)
+	end
+	OCWow.SwitchTab(1)
+
+	local ticker = CreateFrame("Frame")
+	ticker:SetScript("OnUpdate", function()
+		if (OCWow.nextTick or 0) > GetTime() then
+			return
+		end
+		OCWow.nextTick = GetTime() + TICK_SECONDS
+		OCWow.Tick()
+	end)
+
+	OCWow.AddHistory(OCWow.ActiveTab(), "system", "OCWow ready. Each tab is its own session; + opens another.")
+	OCWow.SayHello()
 end
 
 local events = CreateFrame("Frame")
 events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 events:SetScript("OnEvent", function(_, event, arg1)
-	if event == "ADDON_LOADED" and arg1 == "OCWow" then
-		local ok, err = pcall(M.init)
+	if event == "ADDON_LOADED" and arg1 == ADDON_NAME then
+		local ok, err = pcall(InitDB)
 		if not ok then
-			report_failure("init", err)
+			ReportFailure("init", err)
 		end
 	elseif event == "PLAYER_LOGIN" then
-		local ok, err = pcall(M.setup)
+		local ok, err = pcall(OCWow.Setup)
 		if not ok then
-			report_failure("setup", err)
+			ReportFailure("setup", err)
 		end
 	end
 end)
@@ -510,5 +867,10 @@ end)
 SLASH_OCWOW1 = "/ocw"
 SLASH_OCWOW2 = "/ocwow"
 SlashCmdList["OCWOW"] = function(msg)
-	M.slash(msg)
+	OCWow.Slash(msg)
+end
+
+SLASH_OCWOWAI1 = "/ai"
+SlashCmdList["OCWOWAI"] = function(msg)
+	OCWow.Send(msg)
 end

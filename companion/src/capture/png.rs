@@ -1,26 +1,28 @@
 //! A tiny PNG decoder, sufficient for the 8-bit RGB/RGBA screenshots produced
-//! by `screencapture`, `grim`, ImageMagick, and friends.
+//! by `screencapture`, `grim`, ImageMagick and friends.
 //!
 //! Only the subset needed for screen capture is supported: 8-bit depth,
 //! non-interlaced, colour types 0 (grey), 2 (RGB), 4 (grey+alpha) and 6 (RGBA).
 
 use anyhow::{bail, Result};
 
-use crate::protocol::pixel::GrayImage;
-
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
-/// A decoded screenshot as 8-bit luminance.
-pub struct DecodedImage {
+/// A decoded screenshot as 8-bit RGB, three bytes per pixel.
+pub struct RgbImage {
     pub width: u32,
     pub height: u32,
-    pub gray: Vec<u8>,
+    pub data: Vec<u8>,
 }
 
-impl DecodedImage {
-    /// Borrow as a [`GrayImage`] view.
-    pub fn as_gray(&self) -> GrayImage<'_> {
-        GrayImage::new(self.width, self.height, &self.gray)
+impl RgbImage {
+    /// The pixel at `(x, y)`, or black when out of bounds.
+    pub fn pixel(&self, x: u32, y: u32) -> (u8, u8, u8) {
+        if x >= self.width || y >= self.height {
+            return (0, 0, 0);
+        }
+        let index = ((y * self.width + x) * 3) as usize;
+        (self.data[index], self.data[index + 1], self.data[index + 2])
     }
 }
 
@@ -38,13 +40,8 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
-fn luma(r: u8, g: u8, b: u8) -> u8 {
-    // Integer Rec. 601 luma.
-    ((299 * r as u32 + 587 * g as u32 + 114 * b as u32) / 1000) as u8
-}
-
-/// Decode a PNG file into 8-bit luminance.
-pub fn decode_png(bytes: &[u8]) -> Result<DecodedImage> {
+/// Decode a PNG file into 8-bit RGB.
+pub fn decode_png(bytes: &[u8]) -> Result<RgbImage> {
     if bytes.len() < 8 || bytes[..8] != PNG_SIGNATURE {
         bail!("not a PNG file");
     }
@@ -141,25 +138,32 @@ pub fn decode_png(bytes: &[u8]) -> Result<DecodedImage> {
     }
 
     let pixels = width as usize * height as usize;
-    let mut gray = vec![0u8; pixels];
-    for (i, g) in gray.iter_mut().enumerate() {
-        *g = match color_type {
-            0 => unfiltered[i],
-            2 => luma(unfiltered[i * 3], unfiltered[i * 3 + 1], unfiltered[i * 3 + 2]),
-            4 => unfiltered[i * 2],
-            6 => luma(
+    let mut data = vec![0u8; pixels * 3];
+    for i in 0..pixels {
+        let (r, g, b) = match color_type {
+            0 => (unfiltered[i], unfiltered[i], unfiltered[i]),
+            2 => (
+                unfiltered[i * 3],
+                unfiltered[i * 3 + 1],
+                unfiltered[i * 3 + 2],
+            ),
+            4 => (unfiltered[i * 2], unfiltered[i * 2], unfiltered[i * 2]),
+            6 => (
                 unfiltered[i * 4],
                 unfiltered[i * 4 + 1],
                 unfiltered[i * 4 + 2],
             ),
             _ => unreachable!(),
         };
+        data[i * 3] = r;
+        data[i * 3 + 1] = g;
+        data[i * 3 + 2] = b;
     }
 
-    Ok(DecodedImage {
+    Ok(RgbImage {
         width,
         height,
-        gray,
+        data,
     })
 }
 
@@ -180,11 +184,11 @@ mod tests {
         let mut ihdr = Vec::new();
         ihdr.extend_from_slice(&width.to_be_bytes());
         ihdr.extend_from_slice(&height.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // depth 8, truecolor, no interlace
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
 
         let mut raw = Vec::new();
         for y in 0..height as usize {
-            raw.push(0); // filter: none
+            raw.push(0);
             raw.extend_from_slice(&pixels[y * width as usize * 3..(y + 1) * width as usize * 3]);
         }
         let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6);
@@ -198,15 +202,18 @@ mod tests {
     }
 
     #[test]
-    fn decodes_black_and_white() {
+    fn decodes_colours() {
         let pixels = vec![
-            0, 0, 0, 255, 255, 255, // row 0: black, white
-            255, 255, 255, 0, 0, 0, // row 1: white, black
+            255, 0, 0, 0, 255, 0, // row 0: red, green
+            0, 0, 255, 255, 255, 0, // row 1: blue, yellow
         ];
         let png = encode_rgb(2, 2, &pixels);
         let img = decode_png(&png).unwrap();
         assert_eq!((img.width, img.height), (2, 2));
-        assert_eq!(img.gray, vec![0, 255, 255, 0]);
+        assert_eq!(img.pixel(0, 0), (255, 0, 0));
+        assert_eq!(img.pixel(1, 0), (0, 255, 0));
+        assert_eq!(img.pixel(0, 1), (0, 0, 255));
+        assert_eq!(img.pixel(1, 1), (255, 255, 0));
     }
 
     #[test]

@@ -1,22 +1,27 @@
-//! Companion configuration: where the addon lives, how to capture the strip,
-//! and how to reach the OpenCode server.
+//! Companion configuration: where the addon lives, where the strip is on
+//! screen, and how to reach the OpenCode server.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::fonts::bank::DEFAULT_SLOTS;
+use crate::slots::{SlotBank, DEFAULT_SLOTS};
+
+/// Interface version written into generated slot addons.
+pub const DEFAULT_INTERFACE: u32 = 16001;
 
 /// Root configuration object, serialised as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Directory of the installed `OCWow` addon (contains `Fonts/`).
+    /// Directory of the installed `OCWow` addon (`…/Interface/AddOns/OCWow`).
     pub addon_dir: PathBuf,
-    /// Number of font-bank slots created by `ocw install`.
-    pub bank_slots: u16,
-    /// Screen-capture settings for the pixel strip.
+    /// Number of load-on-demand slot addons created by `ocw install`.
+    pub slots: u16,
+    /// `## Interface:` written into generated slot addons.
+    pub interface: u32,
+    /// Screen capture settings.
     pub capture: CaptureSettings,
     /// OpenCode server settings.
     pub opencode: OpenCodeSettings,
@@ -27,10 +32,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            addon_dir: detect_addon_dir().unwrap_or_else(|| {
-                PathBuf::from("Interface/AddOns/OCWow")
-            }),
-            bank_slots: DEFAULT_SLOTS,
+            addon_dir: detect_addon_dir().unwrap_or_else(|| PathBuf::from("Interface/AddOns/OCWow")),
+            slots: DEFAULT_SLOTS,
+            interface: DEFAULT_INTERFACE,
             capture: CaptureSettings::default(),
             opencode: OpenCodeSettings::default(),
             projects_root: None,
@@ -46,9 +50,9 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Config =
+        let config: Config =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        Ok(cfg)
+        Ok(config)
     }
 
     /// Write configuration to `path`, creating parent directories.
@@ -56,49 +60,37 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(path, serde_json::to_string_pretty(self)?)
+            .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
 
-    /// The font bank for this configuration.
-    pub fn bank(&self) -> crate::fonts::Bank {
-        crate::fonts::Bank::new(self.addon_dir.join("Fonts"), self.bank_slots)
+    /// The slot bank this configuration describes.
+    pub fn slot_bank(&self) -> SlotBank {
+        SlotBank::new(self.addon_dir.clone(), self.slots)
     }
 }
 
-/// Where the pixel strip is on screen, and how to grab it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Where the strip is on screen, and how to grab it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CaptureSettings {
+    /// Optional capture command template (see `docs/setup.md`).
+    pub command: Option<String>,
+    /// Cached strip location, discovered by `ocw probe`.
+    pub strip: Option<StripSettings>,
+}
+
+/// A cached screen rectangle, in points, that contains the strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StripSettings {
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
-    /// Cell edge length in screen pixels; `0` means auto-detect.
-    pub cell_px: u32,
-    /// Optional capture command template (see `docs/setup.md`).
-    pub command: Option<String>,
 }
 
-impl Default for CaptureSettings {
-    fn default() -> Self {
-        Self {
-            x: 8,
-            y: 8,
-            width: crate::protocol::pixel::STRIP_COLS as u32
-                * crate::protocol::pixel::DEFAULT_CELL_PX,
-            height: crate::protocol::pixel::STRIP_ROWS as u32
-                * crate::protocol::pixel::DEFAULT_CELL_PX,
-            // 0 means "derive the cell size from the captured width", which is
-            // required for Retina and otherwise scaled displays.
-            cell_px: 0,
-            command: None,
-        }
-    }
-}
-
-impl CaptureSettings {
+impl StripSettings {
     pub fn region(&self) -> crate::capture::Region {
         crate::capture::Region {
             x: self.x,
@@ -143,10 +135,6 @@ pub fn read_service_password() -> Option<String> {
 }
 
 /// Read the running service's URL and password from its registration file.
-///
-/// The background service writes `~/.local/state/opencode/service.json` (or the
-/// platform equivalent) with the dynamic port it bound to. Preferring this over
-/// a fixed port means the companion follows whatever the user already runs.
 pub fn read_service_registration() -> Option<(String, String)> {
     let mut candidates = Vec::new();
     if let Some(home) = home_dir() {
@@ -261,22 +249,27 @@ mod tests {
 
     #[test]
     fn config_round_trips() {
-        let mut cfg = Config::default();
-        cfg.capture.x = 100;
-        cfg.bank_slots = 32;
+        let mut config = Config::default();
+        config.slots = 32;
+        config.capture.strip = Some(StripSettings {
+            x: 10,
+            y: 20,
+            width: 800,
+            height: 192,
+        });
         let dir = std::env::temp_dir().join(format!("ocw-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");
-        cfg.save(&path).unwrap();
+        config.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
-        assert_eq!(loaded.capture.x, 100);
-        assert_eq!(loaded.bank_slots, 32);
+        assert_eq!(loaded.slots, 32);
+        assert_eq!(loaded.capture.strip.unwrap().width, 800);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn missing_config_yields_defaults() {
-        let cfg = Config::load(Path::new("/definitely/not/here.json")).unwrap();
-        assert!(cfg.bank_slots > 0);
+        let config = Config::load(Path::new("/definitely/not/here.json")).unwrap();
+        assert_eq!(config.slots, DEFAULT_SLOTS);
     }
 }

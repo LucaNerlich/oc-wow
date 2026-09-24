@@ -10,30 +10,33 @@ upgrade?") and for real coding work in any project on your machine.
 ```
   WoW addon (Lua, sandboxed)              Companion (Rust, cross-platform)        OpenCode
   ──────────────────────────              ────────────────────────────────        ────────
-  panel: chat | context | commands        pixel-strip decoder  (screen capture) ─┐
-   • prompt box                           font-metric encoder  (TTF writer)    ─┘ transport
+  tabs: one session each                  pixel-strip decoder  (screen capture) ─┐
+   • prompt box                           slot-bank writer     (files)         ─┘ transport
    • game-state context tiers             OpenCode HTTP client ────────────────► serve (V2 API)
    • /model /new /stop commands           git / VCS reporting
-   • completion + error messages          context assembler
+   • status + progress                    context assembler
 ```
 
 ## How the two channels work
 
-WoW addons are sandboxed: no sockets, no file reads. OCWow moves data with two
-mechanisms that need neither, and that inject no input and touch no game memory.
+WoW addons are sandboxed: no sockets, no file reads at runtime. OCWow moves data
+with two mechanisms that need neither, and that inject no input and touch no game
+memory.
 
-| Direction | Carrier | What the receiver reads |
-|-----------|---------|-------------------------|
-| addon → companion | a 128×4 black/white pixel strip | bits sampled from a screen capture |
-| companion → addon | a generated TrueType font | glyph advance widths via `GetStringWidth` |
+| Direction | Carrier | Receiver reads |
+|-----------|---------|----------------|
+| addon → companion | a strip of coloured cells in the game window's top-left | pixels from a screen capture |
+| companion → addon | load-on-demand slot addons | Lua globals set by files read from disk |
 
-The addon paints 64 bytes per frame onto a small strip. The companion
-screen-captures just that region and decodes Adler-32-checked packets. For the
-return path the companion writes a font whose glyph advances encode bytes
-0–255; the addon loads the font and measures text widths to recover the reply
-as an ordinary Lua string. Because the client caches a font after its first
-load, the installer pre-creates a bank of unused font filenames that the
-companion replaces one at a time — so ordinary messages need no `/reload`.
+**Outbound** the addon paints the message as 3-bit cells (pure primaries, 4 px
+each, ~3.5 KB per frame) anchored so one UI unit is exactly one physical pixel.
+The companion finds the strip by its fixed magic bytes and decodes it.
+
+**Inbound** `ocw install` pre-creates 200 `## LoadOnDemand: 1` addons;
+`C_AddOns.LoadAddOn` re-reads a slot's Lua from disk when the game loads it. The
+companion writes the current state of every chat into all 200, and the addon
+loads a fresh one on a timer or when a signal fires. No fonts, no chat log, no
+manual calibration.
 
 See [docs/protocol.md](docs/protocol.md) for the byte-level specification and
 [docs/architecture.md](docs/architecture.md) for the design.
@@ -42,86 +45,77 @@ See [docs/protocol.md](docs/protocol.md) for the byte-level specification and
 
 | Area | State |
 |------|-------|
-| Pixel-strip outbound transport | implemented, protocol-tested (not yet confirmed in-game) |
-| Font-metric inbound transport | implemented, round-trip tested, independently validated |
+| Pixel-strip outbound transport | implemented, round-trip tested |
+| Load-on-demand slot inbound | implemented, round-trip tested |
 | OpenCode V2 session + prompt + polling | implemented, validated live end-to-end |
+| Tabs, one OpenCode session each | implemented, isolation verified end-to-end |
 | Game-state context (tiered, size-capped) | implemented |
 | Git summary in the prompt preamble | implemented |
 | `/stop`, `/new`, `/model`, `/help` commands | implemented |
-| In-game project/session/model pickers | planned |
-| In-game Git tab | planned |
-| Windows / Linux capture templates | documented, not shipped |
+| Live progress, permission prompts | planned |
+| Reply echo into a dedicated chat tab, item links | planned |
 
-The pixel strip and the font-caching behaviour are empirical: they have been
-validated for WoW Forever (`wow_classic_beta`, 1.60.1) and depend on
-undocumented client behaviour. A client patch can break the transport.
+The transport depends on undocumented client behaviour (the UI-scale trick and
+the load-on-demand file rules), validated against WoW Forever
+(`wow_classic_beta`, 1.60.1). A client patch can break it.
 
 ## Verification
 
-Every claim above is backed by a repeatable check. From a clean checkout:
-
 ```sh
 cd companion
-cargo test --offline            # 52 unit + 4 integration tests, all passing
+cargo test --offline            # 45 unit + 6 integration tests, all passing
 cargo run --offline -- selftest # bridge round-trip, no game client needed
 cargo run --offline -- selftest --live --model opencode/mimo-v2.6-flash-free
 
 python3 ../tools/check_lua.py ../addon/OCWow/*.lua
-python3 ../tools/validate_font.py target/debug/...   # macOS CoreText check
 ```
-
-What each covers:
 
 | Check | Evidence |
 |-------|----------|
-| `cargo test` | frame encode/decode, Adler-32 vectors, pixel strip render/decode/search, TTF structure + checksums + byte round-trip, PNG decoding, HTTP chunked parsing + base64, OpenCode reply extraction, context splitting/truncation, git formatting, fragment reassembly |
-| `ocw selftest` | prompt frame → job → worker → font bank → decoded reply, in-process |
-| `ocw selftest --live` | real OpenCode session in a project; "pong" returned through the font bank; session deleted afterwards |
-| `tools/validate_font.py` | macOS CoreText loads the generated TTF and confirms units-per-em, cmap glyph ids, and that advance widths encode the expected bytes |
-| `tools/check_lua.py` | Lua block balance (no interpreter required) |
-
-The pixel strip is the one piece that cannot be tested without a display; it is
-covered by protocol tests plus `ocw probe` and startup auto-calibration, and
-needs one confirmation in game.
+| `cargo test` | cell packing, frame encode/decode, Fletcher-16, magic/checksum rejection, strip location at several cell sizes and offsets, PNG decoding, slot-bank generation and publishing, Lua escaping, record parsing, OpenCode reply extraction, context splitting, git formatting |
+| `ocw selftest` | strip payload → job → worker → slot bank → reply, in-process, two tabs isolated |
+| `ocw selftest --live` | real OpenCode session in a project; "pong" returned through the slot bank; session deleted afterwards |
+| `tools/check_lua.py` | Lua block balance, method-call syntax, and use of globals this client omits |
 
 ## Quick start
 
 Only the last step needs to run each time you play: `ocw run` **is** the
-companion process, so it must be running (in any terminal) while you are in
-game.
+companion process, so it must be running (in any terminal) while you are in game.
 
 ### Two command surfaces
 
-These are easy to confuse, so to be explicit:
-
-* **Your terminal** (outside the game) runs the `ocw` binary: `install`,
-  `probe`, `run`, `ping`, `models`, `projects`, `dump`, `font`, `selftest`,
-  `paths`. Typing these into WoW's chat box does nothing.
-* **WoW's chat box** (in game) runs slash commands: `/ocw`, `/ocw calibrate`,
-  `/ocw ctx`, `/ocw context on|off`, `/ocw new`, `/ocw stop`,
-  `/ocw model <provider/model>`, `/ocw help`, `/ocw status`. Typing these into a
-  terminal does nothing.
-
-Once `ocw run` is running, you mostly stay in game: open the panel with `/ocw`
-and type prompts into its input box, or send a one-liner from chat with
-`/ocw <prompt>` (anything after `/ocw` that is not a known subcommand is sent as
-a prompt).
+* **Your terminal** runs the `ocw` binary: `install`, `probe`, `run`, `ping`,
+  `models`, `projects`, `selftest`, `paths`.
+* **WoW's chat box** runs slash commands: `/ocw`, `/ocw tab <n>`, `/ocw newtab`,
+  `/ocw closetab`, `/ocw rename`, `/ocw ctx`, `/ocw context on|off`, `/ocw test`,
+  `/ocw resend`, `/ocw status`, `/ocw transport on|off`, and `/ai <text>` to send
+  from the chat box.
 
 ### One-time setup
 
 ```sh
 cd companion
-cargo build --release          # produces target/release/ocw
+cargo build --release
 
-# install the addon and build the font bank
+# install the addon and create the slot bank (200 addons beside OCOWow)
 ./target/release/ocw install --addon-dir "/Applications/World of Warcraft/_classic_beta_/Interface/AddOns/OCWow"
 ```
 
-In game: enable **OCWow** in the addon list, then `/reload`.
+**Fully quit and relaunch WoW** — the client only discovers files that existed at
+launch. Enable *OCWow* on the AddOns screen and leave the `OCWow Slot …` entries
+disabled; they are transport files.
 
-Optional, once: `/ocw calibrate` in game and `ocw probe` in a terminal, which
-finds the strip and saves the exact crop. You can skip this — `ocw run`
-auto-calibrates on startup.
+Then, in game, run `/ocw test` to put the strip on screen, and in a terminal:
+
+```sh
+./target/release/ocw probe
+```
+
+`probe` captures the screen, finds the strip, and remembers where it is.
+
+On macOS, `probe` and `run` need **Screen Recording** permission for your
+terminal (System Settings → Privacy & Security → Screen Recording), and WoW must
+be windowed or borderless — exclusive fullscreen blocks capture.
 
 ### Every play session
 
@@ -129,63 +123,35 @@ auto-calibrates on startup.
 ./target/release/ocw run --project ~/code/my-project
 ```
 
-Leave it running while you play. Then in game: `/ocw`, type a prompt, press
-Enter. Closing the terminal stops the bridge.
-
-`ocw run --mock` uses a local echo backend, which is the fastest way to verify
-the transport before involving a model.
-
-On startup the companion captures once, searches for the strip, adopts what it
-finds and saves the crop to the config — so `probe` is mainly a diagnostic, and
-later runs start already calibrated. If you move the WoW window to another
-monitor or change UI scale, the saved crop stops decoding and `run`
-re-calibrates automatically.
+Leave it running while you play. In game: `/ocw`, type a prompt, press Enter.
+`ocw run --mock` uses a local echo backend, the fastest way to verify the
+transport before involving a model.
 
 ## Updating
 
-The addon sources are embedded in the binary, so `ocw install` is the whole
-deploy step. What you need to do depends on what changed:
-
-| Changed | Rebuild the binary? | Regenerate the font bank? |
-|---------|--------------------|---------------------------|
-| Addon Lua / TOC | no, with `--from` | no |
-| Wire protocol or font format | yes | yes (`--force`) |
-| Fresh checkout | yes | yes (first install) |
+| Changed | Rebuild the binary? | Re-run install? |
+|---------|--------------------|-----------------|
+| Addon Lua | no, with `--from` | yes (`--from addon/OCWow --no-slots`) |
+| Wire protocol / slots | yes | yes, then restart WoW |
 
 Fast loop while editing the addon — no Rust rebuild:
 
 ```sh
-ocw install --from addon/OCWow --no-bank
+ocw install --from addon/OCWow --no-slots
 ```
 
-Full update from a built binary:
-
-```sh
-cargo build --release
-./target/release/ocw install
-```
-
-Then `/reload` in game. A full client restart is only needed after the **font
-bank** changes, because the client discovers addon resources at startup.
-
-Two cautions:
-
-- `--force` rewrites every font slot and **must not** run while the game is
-  running — the client may already have loaded those files.
-- After a game patch, bump `## Interface:` in `addon/OCWow/OCWow.toc` to the new
-  build number, or the addon is flagged as out of date.
+Then `/reload` in game. A full client restart is only needed when the slot bank
+changes, because the client discovers addon files at startup.
 
 ## Commands
 
 | Command | Purpose |
 |---------|---------|
-| `ocw install` | write addon files and create the font bank |
-| `ocw probe` | capture once and locate the pixel strip (calibration) |
+| `ocw install` | write the addon files and create the slot bank |
+| `ocw probe` | find the pixel strip on screen and remember it |
 | `ocw run` | serve the bridge (`--mock` for a local echo backend) |
 | `ocw selftest` | in-process bridge round-trip (`--live` to call OpenCode) |
 | `ocw ping` / `ocw models` / `ocw projects` | inspect the OpenCode server |
-| `ocw dump --slot N` | decode the reply stored in a font slot |
-| `ocw font --out F --text "..."` | build a reply font from text (debugging) |
 | `ocw paths` | show resolved configuration paths |
 
 `ocw run` flags:
@@ -193,26 +159,12 @@ Two cautions:
 | Flag | Meaning |
 |------|---------|
 | `--mock` | local echo backend |
-| `--project DIR` | working directory the agent runs in; new sessions are scoped to it |
+| `--project DIR` | working directory the agent runs in |
 | `--model provider/model` | default model |
-| `--crop x,y,w,h` \| `full` | strip location |
-| `--cell N` | cell size in pixels (`0` = auto, required for Retina) |
 | `--capture-cmd TEMPLATE` | custom capture command |
-| `--poll-ms N` | strip sample interval (default 120 ms) |
+| `--poll-ms N` | strip sampling interval (default 250 ms) |
 | `--duration N` | stop after N seconds |
-| `--verbose` | log decoded frames and slot writes |
-
-In-game:
-
-| Input | Purpose |
-|-------|---------|
-| `/ocw` | toggle the panel |
-| `/ocw calibrate` | show a fixed strip frame for calibration |
-| `/ocw ctx` | cycle game context: light → normal → full |
-| `/ocw context on\|off` | include or omit game state |
-| `/ocw new`, `/ocw stop`, `/ocw model <provider/model>`, `/ocw help` | session commands |
-| `/ocw status` | transport diagnostics |
-| `/ocw transport on\|off` | disable the strip and all font reads (safety switch) |
+| `--verbose` | log decoded frames and publishes |
 
 ## Game context
 
@@ -221,22 +173,17 @@ companion truncates it at 1,200 bytes). Three tiers:
 
 * **light** (default) — `player`, `location` (zone/subzone/coords), `group`,
   `in_combat`, `resting`, `instance`.
-* **normal** — adds `target`, `focus`, `vitals`, `gear` (avg item level),
-  `money`, `durability`, `bags`, `quests`.
+* **normal** — adds `target`, `focus`, `vitals`, `gear`, `money`, `durability`,
+  `bags`, `quests`.
 * **full** — adds `guild`, `professions`, `played_seconds`.
 
-Cycle with `/ocw ctx`, or disable entirely with `/ocw context off`. The
-companion frames the block so the model treats it as situational metadata, and
-prepends a short preamble plus a git summary (branch, ahead/behind, changed
-files, last commits) for the active project.
+Cycle with `/ocw ctx`, or disable with `/ocw context off`. Combat values this
+client marks "secret" are dropped rather than formatted.
 
 ## OpenCode integration
 
 The companion targets the OpenCode **V2 HTTP API** and discovers the running
-service (URL and password) from `~/.local/state/opencode/service.json`, so it
-follows whatever port your background service bound to.
-
-Notes for anyone extending this:
+service from `~/.local/state/opencode/service.json`.
 
 * Auth is HTTP Basic with the literal username `opencode` and the service
   password.
@@ -244,44 +191,27 @@ Notes for anyone extending this:
 * `POST /api/session/{id}/prompt` **enqueues** and returns immediately, so the
   companion polls `GET /api/session/{id}/message` until the newest assistant
   message has a `finish` value.
-* Sessions are created with `POST /api/session` (`{title, model:{id,providerID},
-  location:{directory}}`); models come from `GET /api/model`; interrupt is
-  `POST /api/session/{id}/interrupt`.
-* The project directory **must** be sent in the session-create body. The
-  `x-opencode-directory` header scopes GETs such as `/api/model` and
-  `/api/vcs`, but is ignored by `POST /api/session`; relying on the header alone
-  silently creates the session in the server's working directory.
+* The project directory **must** be in the session-create body; the
+  `x-opencode-directory` header is ignored by `POST /api/session`.
 
 ## Requirements
 
-- Rust 1.74+ (to build the companion). Builds work offline with the vendored
-  dependency cache; the dependency set is deliberately tiny.
-- Python 3 (only for the optional dev tools).
-- WoW running windowed or borderless with the strip visible and unobscured.
+- Rust 1.74+ (to build the companion). Builds work offline; five dependencies.
+- Python 3 (only for the optional Lua check).
+- WoW windowed or borderless, with the game window on screen.
 - macOS: Screen Recording permission for your terminal.
 - A running OpenCode service (`opencode2`).
 
 ## Documentation
 
-- [docs/setup.md](docs/setup.md) — install, calibration, cross-platform capture
-  templates, troubleshooting.
-- [docs/protocol.md](docs/protocol.md) — the byte-level wire protocol.
-- [docs/architecture.md](docs/architecture.md) — components, data flow, design
-  decisions, roadmap.
+- [docs/setup.md](docs/setup.md) — install, updating, troubleshooting.
+- [docs/protocol.md](docs/protocol.md) — the wire protocol.
+- [docs/architecture.md](docs/architecture.md) — components, data flow, decisions.
 - [AGENTS.md](AGENTS.md) — guidance for agents working on the repo.
-
-## Development
-
-```sh
-cd companion && cargo test --offline
-cargo run --offline -- selftest
-cargo run --offline -- selftest --live --model opencode/mimo-v2.6-flash-free
-python3 tools/check_lua.py addon/OCWow/*.lua
-python3 tools/validate_font.py <generated font>
-```
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The transport technique is inspired by
+MIT — see [LICENSE](LICENSE). The transport design follows
+[`chelinho139/wow-claude`](https://github.com/chelinho139/wow-claude) and
 [`0xinuarashi/wow-forever-codex`](https://github.com/0xinuarashi/wow-forever-codex);
-the protocol and all code here are an independent implementation.
+the code here is an independent implementation.

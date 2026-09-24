@@ -14,7 +14,8 @@ pub use opencode::{ModelRef, OpenCode};
 /// A question routed from the addon to a backend.
 #[derive(Debug, Clone)]
 pub struct AskRequest {
-    pub ui_session: u16,
+    /// Which addon tab (i.e. which OpenCode session) asked.
+    pub tab: u8,
     pub request_id: u32,
     /// The user's prompt text.
     pub text: String,
@@ -66,10 +67,26 @@ impl Backend {
         }
     }
 
+    /// Switch the model of an existing session.
+    pub fn switch_model(&self, session_id: &str, model: &ModelRef) -> Result<()> {
+        match self {
+            Backend::Mock(_) => Ok(()),
+            Backend::OpenCode(b) => b.switch_model(session_id, model),
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Backend::Mock(_) => "mock (local echo)".to_string(),
             Backend::OpenCode(b) => b.describe(),
+        }
+    }
+
+    /// The server's default model, when the backend has one.
+    pub fn default_model(&self) -> Option<ModelRef> {
+        match self {
+            Backend::Mock(_) => None,
+            Backend::OpenCode(b) => b.default_model().ok().flatten(),
         }
     }
 }

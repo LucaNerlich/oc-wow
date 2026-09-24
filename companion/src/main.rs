@@ -1,16 +1,14 @@
 //! `ocw` - the OCWow companion binary.
 //!
 //! Subcommands:
-//!   * `install`  - write the addon and build the font bank
-//!   * `probe`    - capture once and locate the pixel strip (calibration)
+//!   * `install`  - write the addon and create the slot bank
+//!   * `probe`    - find the pixel strip on screen and remember where it is
 //!   * `run`      - serve the bridge (real OpenCode server or `--mock`)
-//!   * `ping`     - check the OpenCode server
-//!   * `models`   - list available models
-//!   * `projects` - list known projects
-//!   * `dump`     - decode the reply stored in a font slot
-//!   * `font`     - build a reply font from text (debug)
+//!   * `ping` / `models` / `projects` - inspect the OpenCode server
+//!   * `selftest` - in-process bridge round-trip
 //!   * `paths`    - show resolved paths
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -19,19 +17,15 @@ use clap::{Args, Parser, Subcommand};
 
 use ocw::app::App;
 use ocw::backend::{Backend, Mock, OpenCode};
-use ocw::capture::{Capturer, Region};
-use ocw::config::{self, Config};
-use ocw::fonts::{Bank, DEFAULT_SLOTS};
-use ocw::protocol::frames::{
-    reply_state, ControlFrame, PromptFrame, ReplyFrame, PROTOCOL_VERSION,
-};
-use ocw::protocol::pixel;
+use ocw::capture::{find_strip, Capturer};
+use ocw::config::{self, Config, StripSettings};
+use ocw::protocol::strip::{self, CELLS_PER_ROW, MAX_ROWS};
+use ocw::slots::{ReplyStatus, SlotBank};
 
 /// Addon sources embedded so the binary is self-contained on any platform.
 const ADDON_FILE_NAMES: &[&str] = &[
     "OCWow.toc",
-    "Protocol.lua",
-    "Native.lua",
+    "Codec.lua",
     "Context.lua",
     "UI.lua",
     "Main.lua",
@@ -39,8 +33,7 @@ const ADDON_FILE_NAMES: &[&str] = &[
 
 const ADDON_FILES: &[(&str, &str)] = &[
     ("OCWow.toc", include_str!("../../addon/OCWow/OCWow.toc")),
-    ("Protocol.lua", include_str!("../../addon/OCWow/Protocol.lua")),
-    ("Native.lua", include_str!("../../addon/OCWow/Native.lua")),
+    ("Codec.lua", include_str!("../../addon/OCWow/Codec.lua")),
     ("Context.lua", include_str!("../../addon/OCWow/Context.lua")),
     ("UI.lua", include_str!("../../addon/OCWow/UI.lua")),
     ("Main.lua", include_str!("../../addon/OCWow/Main.lua")),
@@ -88,9 +81,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Write the addon files and create the font bank.
+    /// Write the addon files and create the load-on-demand slot bank.
     Install(InstallArgs),
-    /// Capture once and locate the pixel strip.
+    /// Find the pixel strip on screen and remember where it is.
     Probe(ProbeArgs),
     /// Run the bridge.
     Run(RunArgs),
@@ -100,10 +93,6 @@ enum Command {
     Models(ServerArgs),
     /// List known projects.
     Projects(ServerArgs),
-    /// Decode the reply stored in a font slot.
-    Dump(DumpArgs),
-    /// Build a reply font from text (debugging).
-    Font(FontArgs),
     /// Run an in-process bridge round-trip without a game client.
     Selftest(SelftestArgs),
     /// Show resolved configuration paths.
@@ -115,29 +104,28 @@ struct InstallArgs {
     /// Addon directory to install into.
     #[arg(long)]
     addon_dir: Option<PathBuf>,
-    /// Number of font-bank slots.
-    #[arg(long, default_value_t = DEFAULT_SLOTS)]
+    /// Number of load-on-demand slots.
+    #[arg(long, default_value_t = ocw::slots::DEFAULT_SLOTS)]
     slots: u16,
-    /// Rewrite existing slot files (unsafe while the game is running).
+    /// `## Interface:` version for generated slots.
+    #[arg(long, default_value_t = config::DEFAULT_INTERFACE)]
+    interface: u32,
+    /// Rewrite existing slot files.
     #[arg(long)]
     force: bool,
-    /// Only write the Lua addon files, not the font bank.
+    /// Only write the addon files, not the slot bank.
     #[arg(long)]
-    no_bank: bool,
-    /// Read the addon Lua/TOC from this directory instead of the copies
-    /// embedded in the binary. Lets you deploy addon edits without rebuilding.
+    no_slots: bool,
+    /// Read the addon Lua/TOC from this directory instead of the embedded copies.
     #[arg(long)]
     from: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 struct ProbeArgs {
-    /// Crop as `x,y,w,h`, or `full` for the whole screen.
+    /// Show every candidate, not just the first match.
     #[arg(long)]
-    crop: Option<String>,
-    /// Cell edge length in pixels (0 = auto-detect).
-    #[arg(long, default_value_t = 0)]
-    cell: u32,
+    all: bool,
     /// Capture command template (see docs/setup.md).
     #[arg(long)]
     capture_cmd: Option<String>,
@@ -160,19 +148,13 @@ struct RunArgs {
     /// OpenCode service password.
     #[arg(long)]
     password: Option<String>,
-    /// Crop as `x,y,w,h`, or `full`.
-    #[arg(long)]
-    crop: Option<String>,
-    /// Cell edge length in pixels (0 = auto-detect).
-    #[arg(long)]
-    cell: Option<u32>,
     /// Capture command template.
     #[arg(long)]
     capture_cmd: Option<String>,
     /// Stop after this many seconds (default: run until Ctrl-C).
     #[arg(long)]
     duration: Option<u64>,
-    /// Strip sample interval in milliseconds.
+    /// Strip sampling interval in milliseconds.
     #[arg(long)]
     poll_ms: Option<u64>,
 }
@@ -204,25 +186,6 @@ struct SelftestArgs {
     password: Option<String>,
 }
 
-#[derive(Args, Debug)]
-struct DumpArgs {
-    #[arg(long)]
-    slot: u16,
-    #[arg(long)]
-    addon_dir: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-struct FontArgs {
-    #[arg(long)]
-    out: PathBuf,
-    #[arg(long)]
-    text: String,
-    /// Write a baseline (all-zero) font instead of encoding text.
-    #[arg(long)]
-    baseline: bool,
-}
-
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
@@ -236,13 +199,11 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Install(args) => cmd_install(&mut cfg, &config_path, args),
-        Command::Probe(args) => cmd_probe(&mut cfg, args),
-        Command::Run(args) => cmd_run(&mut cfg, &config_path, args, cli.verbose),
+        Command::Probe(args) => cmd_probe(&mut cfg, &config_path, args),
+        Command::Run(args) => cmd_run(&mut cfg, args, cli.verbose),
         Command::Ping(args) => cmd_ping(&cfg, args),
         Command::Models(args) => cmd_models(&cfg, args),
         Command::Projects(args) => cmd_projects(&cfg, args),
-        Command::Dump(args) => cmd_dump(&cfg, args),
-        Command::Font(args) => cmd_font(args),
         Command::Selftest(args) => cmd_selftest(&mut cfg, args),
         Command::Paths => cmd_paths(&cfg, &config_path),
     }
@@ -254,61 +215,31 @@ fn load_config(path: &Option<PathBuf>) -> Result<(Config, PathBuf)> {
     Ok((cfg, config_path))
 }
 
-fn parse_region(spec: &str) -> Result<Region> {
-    if spec.eq_ignore_ascii_case("full") {
-        return Ok(Region::full_screen());
-    }
-    let parts: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
-    if parts.len() != 4 {
-        bail!("crop must be `x,y,w,h` or `full`, got {spec:?}");
-    }
-    Ok(Region {
-        x: parts[0].parse().context("crop x")?,
-        y: parts[1].parse().context("crop y")?,
-        width: parts[2].parse().context("crop width")?,
-        height: parts[3].parse().context("crop height")?,
-    })
-}
-
-fn apply_capture_overrides(
-    cfg: &mut Config,
-    crop: Option<&String>,
-    cell: Option<u32>,
-    capture_cmd: Option<&String>,
-) -> Result<()> {
-    if let Some(spec) = crop {
-        let region = parse_region(spec)?;
-        cfg.capture.x = region.x;
-        cfg.capture.y = region.y;
-        cfg.capture.width = region.width;
-        cfg.capture.height = region.height;
-    }
-    if let Some(cell) = cell {
-        cfg.capture.cell_px = cell;
-    }
-    if let Some(cmd) = capture_cmd {
-        cfg.capture.command = Some(cmd.clone());
-    }
-    Ok(())
-}
-
-/// Resolve the server URL and password, preferring the live service registration.
 fn resolve_server(
     cfg: &Config,
     base_url: &Option<String>,
     password: &Option<String>,
 ) -> (String, Option<String>) {
     if let Some(url) = base_url {
-        return (url.clone(), password.clone().or_else(|| cfg.opencode.password.clone()));
+        return (
+            url.clone(),
+            password.clone().or_else(|| cfg.opencode.password.clone()),
+        );
     }
     if let Some((url, pw)) = config::read_service_registration() {
         return (url, password.clone().or(Some(pw)));
     }
-    (cfg.opencode.base_url.clone(), password.clone().or_else(|| cfg.opencode.password.clone()))
+    (
+        cfg.opencode.base_url.clone(),
+        password.clone().or_else(|| cfg.opencode.password.clone()),
+    )
 }
 
 fn cmd_install(cfg: &mut Config, config_path: &PathBuf, args: InstallArgs) -> Result<()> {
-    let addon_dir = args.addon_dir.clone().unwrap_or_else(|| cfg.addon_dir.clone());
+    let addon_dir = args
+        .addon_dir
+        .clone()
+        .unwrap_or_else(|| cfg.addon_dir.clone());
     std::fs::create_dir_all(&addon_dir)
         .with_context(|| format!("creating addon directory {}", addon_dir.display()))?;
 
@@ -337,86 +268,80 @@ fn cmd_install(cfg: &mut Config, config_path: &PathBuf, args: InstallArgs) -> Re
         }
     }
 
-    if !args.no_bank {
-        let bank = Bank::new(addon_dir.join("Fonts"), args.slots);
-        let report = bank.install(args.force)?;
+    if !args.no_slots {
+        let bank = SlotBank::new(addon_dir.clone(), args.slots);
+        let report = bank.install(args.interface, args.force)?;
         println!(
-            "font bank: {} slots in {} ({} hard-linked, {} copied)",
+            "slot bank: {} slots in {} ({} created, {} signal files)",
             report.slots,
-            report.dir.display(),
-            report.hard_linked,
-            report.copied
+            report.addons_dir.display(),
+            report.created,
+            report.signals
+        );
+        println!(
+            "note: slots are separate addons in the AddOns list; leave them disabled. \
+             Restart WoW after installing so the client discovers them."
         );
     }
 
     cfg.addon_dir = addon_dir;
-    cfg.bank_slots = args.slots;
+    cfg.slots = args.slots;
+    cfg.interface = args.interface;
     cfg.save(config_path)?;
     println!("configuration saved to {}", config_path.display());
-    println!("\nNext: /reload in game (or restart the client if new assets are not discovered),");
-    println!("then run `ocw probe` and `ocw run`.");
+    println!("\nNext: fully restart WoW, then run `ocw probe` while the strip is visible.");
     Ok(())
 }
 
-fn cmd_probe(cfg: &mut Config, args: ProbeArgs) -> Result<()> {
-    apply_capture_overrides(
-        cfg,
-        args.crop.as_ref(),
-        if args.cell == 0 { None } else { Some(args.cell) },
-        args.capture_cmd.as_ref(),
-    )?;
-
-    let region = cfg.capture.region();
-    println!("capturing region {:?}...", region);
-    let capturer = Capturer::new(region, cfg.capture.command.clone(), cfg.capture.cell_px);
-    let image = capturer.capture()?;
+fn cmd_probe(cfg: &mut Config, config_path: &PathBuf, args: ProbeArgs) -> Result<()> {
+    let capturer = Capturer::new(args.capture_cmd.clone().or(cfg.capture.command.clone()));
+    println!("capturing the whole screen...");
+    let image = capturer.capture_full()?;
     println!("captured {}x{} pixels", image.width, image.height);
 
-    let gray = image.as_gray();
-    match pixel::find_strip(&gray) {
-        Some((cell, dx, dy, bytes)) => {
-            let kind = match bytes[2] {
-                1 => "prompt",
-                2 => "control",
-                other => {
-                    let _ = other;
-                    "unknown"
-                }
+    match find_strip(&image) {
+        Some(location) => {
+            let scale = capturer.point_scale().unwrap_or(1.0);
+            let to_points = |value: u32| (value as f64 / scale).round() as i32;
+            let settings = StripSettings {
+                x: to_points(location.x) - 24,
+                y: to_points(location.y) - 24,
+                width: to_points(location.width()) as u32 + 48,
+                height: to_points(location.height(MAX_ROWS)) as u32 + 48,
             };
-            println!("found strip: cell={cell}px, offset=({dx}, {dy}), frame type={kind}");
-            let width = pixel::STRIP_COLS as u32 * cell;
-            let height = pixel::STRIP_ROWS as u32 * cell;
             println!(
-                "suggested: --crop {},{},{},{}",
-                region.x + dx as i32,
-                region.y + dy as i32,
-                width,
-                height
+                "strip found: cell {}px at image ({}, {}), capture scale {scale}",
+                location.cell_px, location.x, location.y
             );
-            println!("save it with: ocw run --crop {},{},{},{} --cell 0",
-                region.x + dx as i32,
-                region.y + dy as i32,
-                width,
-                height);
+            println!(
+                "screen rectangle: {}x{} points at {},{}",
+                settings.width, settings.height, settings.x, settings.y
+            );
+            cfg.capture.strip = Some(settings);
+            cfg.save(config_path)?;
+            println!("saved to {}", config_path.display());
         }
         None => {
             println!("no strip found.");
-            println!(" - in game, run `/ocw calibrate` to show a fixed frame");
-            println!(" - make sure the WoW window is visible (windowed or borderless)");
+            println!(" - in game, open the panel with /ocw and send anything, or run /ocw test");
+            println!(" - make sure WoW is windowed or borderless and the window is on screen");
             println!(" - grant Screen Recording permission to your terminal");
-            println!(" - try a wider probe: ocw probe --crop full");
+            println!(
+                " - the strip is {}x{} cells of {}px in the top-left of the game window",
+                CELLS_PER_ROW,
+                MAX_ROWS,
+                strip::CELL_PX
+            );
+            let _ = args.all;
         }
     }
     Ok(())
 }
 
-fn cmd_run(cfg: &mut Config, config_path: &PathBuf, args: RunArgs, verbose: bool) -> Result<()> {
-    apply_capture_overrides(
-        cfg,
-        args.crop.as_ref(),
-        args.cell,
-        args.capture_cmd.as_ref(),
-    )?;
+fn cmd_run(cfg: &mut Config, args: RunArgs, verbose: bool) -> Result<()> {
+    if let Some(command) = args.capture_cmd.clone() {
+        cfg.capture.command = Some(command);
+    }
     if let Some(project) = args.project.clone() {
         cfg.opencode.project = Some(project);
     }
@@ -439,8 +364,7 @@ fn cmd_run(cfg: &mut Config, config_path: &PathBuf, args: RunArgs, verbose: bool
     };
 
     let mut app = App::new(cfg.clone(), backend, verbose)?;
-    app.set_config_path(config_path.clone());
-    app.check_bank()?;
+    app.check_slots()?;
     if let Some(ms) = args.poll_ms {
         app.set_poll_ms(ms);
     }
@@ -450,9 +374,11 @@ fn cmd_run(cfg: &mut Config, config_path: &PathBuf, args: RunArgs, verbose: bool
 fn cmd_ping(cfg: &Config, args: ServerArgs) -> Result<()> {
     let (url, password) = resolve_server(cfg, &args.base_url, &args.password);
     let client = ocw::http::Client::new(&url, password)?;
-    let health = client.get_json("/api/health")?;
     println!("{url}");
-    println!("{}", serde_json::to_string_pretty(&health)?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&client.get_json("/api/health")?)?
+    );
     Ok(())
 }
 
@@ -468,8 +394,7 @@ fn opencode_for(cfg: &Config, args: &ServerArgs) -> Result<OpenCode> {
 }
 
 fn cmd_models(cfg: &Config, args: ServerArgs) -> Result<()> {
-    let backend = opencode_for(cfg, &args)?;
-    let models = backend.list_models()?;
+    let models = opencode_for(cfg, &args)?.list_models()?;
     println!("{} models:", models.len());
     for model in models {
         println!("  {}", model.label());
@@ -478,8 +403,7 @@ fn cmd_models(cfg: &Config, args: ServerArgs) -> Result<()> {
 }
 
 fn cmd_projects(cfg: &Config, args: ServerArgs) -> Result<()> {
-    let backend = opencode_for(cfg, &args)?;
-    let projects = backend.list_projects()?;
+    let projects = opencode_for(cfg, &args)?.list_projects()?;
     println!("{} projects:", projects.len());
     for project in projects {
         let canonical = project.get("canonical").and_then(|v| v.as_str()).unwrap_or("?");
@@ -489,66 +413,35 @@ fn cmd_projects(cfg: &Config, args: ServerArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_dump(cfg: &Config, args: DumpArgs) -> Result<()> {
-    let addon_dir = args.addon_dir.clone().unwrap_or_else(|| cfg.addon_dir.clone());
-    let bank = Bank::new(addon_dir.join("Fonts"), cfg.bank_slots);
-    let bytes = bank.read_reply(args.slot)?;
-    match ReplyFrame::decode(&bytes) {
-        Ok(frame) => {
-            println!("slot {} holds a valid packet:", args.slot);
-            println!("  state: {}", ocw::protocol::frames::reply_state::name(frame.state));
-            println!("  request: {} (session {})", frame.request_id, frame.ui_session);
-            println!("  fragment: {}/{}", frame.fragment_index, frame.fragment_count);
-            println!("  revision: {}", frame.revision);
-            println!("  payload: {}", String::from_utf8_lossy(&frame.payload));
-        }
-        Err(err) => println!("slot {} has no valid packet ({err})", args.slot),
-    }
-    Ok(())
+/// Build the strip payload the addon would send for one message.
+fn record_payload(session: &str, tab: u8, request: u32, flags: &str, text: &str) -> Vec<u8> {
+    [
+        session.to_string(),
+        tab.to_string(),
+        request.to_string(),
+        String::new(),
+        flags.to_string(),
+        format!("Chat {tab}"),
+        text.to_string(),
+    ]
+    .join("\u{1f}")
+    .into_bytes()
 }
 
-fn cmd_font(args: FontArgs) -> Result<()> {
-    if args.baseline {
-        std::fs::write(&args.out, ocw::fonts::build_baseline_font())?;
-        println!("wrote baseline font to {}", args.out.display());
-        return Ok(());
-    }
-    let mut packet = [0u8; 512];
-    let frame = ReplyFrame {
-        state: ocw::protocol::frames::reply_state::DONE,
-        ui_session: 1,
-        request_id: 1,
-        fragment_index: 1,
-        fragment_count: 1,
-        revision: 1,
-        slot: 1,
-        flags: 0,
-        payload: args.text.as_bytes().to_vec(),
-    };
-    let encoded = frame.encode();
-    packet.copy_from_slice(&encoded);
-    let font = ocw::fonts::build_reply_font(&packet);
-    std::fs::write(&args.out, font)?;
-    println!(
-        "wrote reply font (protocol v{PROTOCOL_VERSION}) to {}",
-        args.out.display()
-    );
-    Ok(())
-}
-
-/// Drive the bridge end-to-end in-process: encode a prompt the way the addon
-/// would, ingest it, then read the reply back out of the font bank.
+/// Drive the bridge end-to-end in-process: feed strip payloads the way the
+/// addon would, then read each tab's reply out of the slot bank.
 fn cmd_selftest(cfg: &mut Config, args: SelftestArgs) -> Result<()> {
     let dir = std::env::temp_dir().join(format!("ocw-selftest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let addon_dir = dir.join("OCWow");
-    let slots = 64u16;
+    let addon_dir = dir.join("AddOns").join("OCWow");
+    std::fs::create_dir_all(&addon_dir)?;
+    let slots = 8u16;
 
-    let bank = Bank::new(addon_dir.join("Fonts"), slots);
-    bank.install(true)?;
+    let bank = SlotBank::new(addon_dir.clone(), slots);
+    bank.install(16001, true)?;
 
-    cfg.addon_dir = addon_dir.clone();
-    cfg.bank_slots = slots;
+    cfg.addon_dir = addon_dir;
+    cfg.slots = slots;
     if let Some(model) = args.model.clone() {
         cfg.opencode.model = Some(model);
     }
@@ -572,83 +465,53 @@ fn cmd_selftest(cfg: &mut Config, args: SelftestArgs) -> Result<()> {
 
     let mut app = App::new(cfg.clone(), backend, false)?;
     app.start()?;
-
-    let ui_session = 4242u16;
-    let request_id = 1u32;
-    let prompt = if args.live {
-        "Reply with exactly the single word: pong"
-    } else {
-        "selftest: hello from the fake addon"
-    };
     println!("backend: {}", app.describe());
-    println!("prompt:  {prompt}");
 
-    let frame = PromptFrame {
-        ui_session,
-        request_id,
-        fragment_index: 0,
-        fragment_count: 1,
-        flags: 0,
-        payload: prompt.as_bytes().to_vec(),
-    };
-    app.ingest_frame(&frame.encode());
+    let tabs: Vec<u8> = if args.live { vec![1] } else { vec![1, 2] };
+    for tab in &tabs {
+        let text = if args.live {
+            "Reply with exactly the single word: pong".to_string()
+        } else {
+            format!("selftest tab {tab}")
+        };
+        println!("tab {tab} prompt: {text}");
+        // The addon sends a record per message; the strip id increments.
+        app.ingest(*tab as u32, &record_payload("selftest", *tab, 1, "", &text));
+    }
 
-    let attempts = if args.live { 180 } else { 16 };
-    let pause = if args.live { 500 } else { 40 };
+    let attempts = if args.live { 180 } else { 40 };
+    let pause = if args.live { 500 } else { 50 };
 
-    let mut slot = 1u16;
-    let mut reply: Option<String> = None;
+    let mut replies: HashMap<u8, String> = HashMap::new();
     for _ in 0..attempts {
         std::thread::sleep(Duration::from_millis(pause));
-        let control = ControlFrame {
-            ui_session,
-            request_id,
-            requested_fragment: 1,
-            slot,
-            deadline_ms: 1000,
-            state: reply_state::WORKING,
-            active: true,
-            last_attempted_slot: slot.saturating_sub(1),
-        };
-        app.ingest_frame(&control.encode());
-
-        let bytes = bank.read_reply(slot)?;
-        if let Ok(packet) = ReplyFrame::decode(&bytes) {
-            if packet.request_id == request_id && packet.slot == slot {
-                println!(
-                    "slot {slot}: state={} payload={:?}",
-                    reply_state::name(packet.state),
-                    String::from_utf8_lossy(&packet.payload)
-                );
-                if packet.state == reply_state::DONE {
-                    reply = Some(String::from_utf8_lossy(&packet.payload).into_owned());
-                    break;
-                }
+        for reply in app.slot_data().replies {
+            if reply.status != ReplyStatus::Working {
+                replies
+                    .entry(reply.tab)
+                    .or_insert_with(|| reply.text.clone());
             }
         }
-        slot += 1;
-        if slot > slots {
-            slot = 1;
+        if replies.len() == tabs.len() {
+            break;
         }
     }
 
-    let session = app.session_id();
+    let sessions = app.session_ids();
     app.stop();
 
-    // Clean up a live session so the test leaves no trace, and verify that it
-    // was actually scoped to the requested project directory.
     let mut project_ok = true;
     if args.live {
-        if let Some(session) = &session {
-            let (url, password) = resolve_server(cfg, &args.base_url, &args.password);
-            if let Ok(client) = OpenCode::new(&url, password, None, None, 60) {
+        let (url, password) = resolve_server(cfg, &args.base_url, &args.password);
+        if let Ok(client) = OpenCode::new(&url, password, None, None, 60) {
+            for (tab, session) in &sessions {
                 if let Ok(info) = client.get_session(session) {
                     let directory = info
                         .get("location")
                         .and_then(|l| l.get("directory"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("?");
-                    println!("session directory: {directory}");
+                    println!("tab {tab} session directory: {directory}");
                     if let Some(expected) = &cfg.opencode.project {
                         let expected = expected.display().to_string();
                         if directory != expected {
@@ -666,32 +529,59 @@ fn cmd_selftest(cfg: &mut Config, args: SelftestArgs) -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&dir);
 
-    let expected = if args.live { "pong" } else { "hello from the fake addon" };
     if !project_ok {
-        bail!("SELFTEST FAILED: session was not scoped to the requested project");
+        bail!("SELFTEST FAILED: a session was not scoped to the requested project");
     }
-    match reply {
-        Some(text) if text.to_lowercase().contains(expected) => {
-            println!("SELFTEST PASSED: reply round-tripped through the font bank");
-            Ok(())
+
+    let mut failed = false;
+    for tab in &tabs {
+        let expected = if args.live {
+            "pong".to_string()
+        } else {
+            format!("tab {tab}")
+        };
+        match replies.get(tab) {
+            Some(text) if text.to_lowercase().contains(&expected.to_lowercase()) => {
+                println!("tab {tab} reply: {text:?}");
+            }
+            Some(text) => {
+                failed = true;
+                eprintln!("SELFTEST FAILED: tab {tab} reply {text:?} lacks {expected:?}");
+            }
+            None => {
+                failed = true;
+                eprintln!("SELFTEST FAILED: tab {tab} got no reply");
+            }
         }
-        Some(text) => bail!("SELFTEST FAILED: unexpected reply {text:?}"),
-        None => bail!("SELFTEST FAILED: no reply arrived"),
     }
+    if failed {
+        bail!("SELFTEST FAILED");
+    }
+
+    println!(
+        "SELFTEST PASSED: {} tab(s) round-tripped through the slot bank",
+        tabs.len()
+    );
+    Ok(())
 }
 
 fn cmd_paths(cfg: &Config, config_path: &PathBuf) -> Result<()> {
     println!("config:     {}", config_path.display());
     println!("state:      {}", ocw::state::default_state_path().display());
     println!("addon dir:  {}", cfg.addon_dir.display());
-    println!("font bank:  {}", cfg.bank().dir().display());
-    println!("bank slots: {}", cfg.bank_slots);
-    println!("crop:       {:?}", cfg.capture.region());
-    if cfg.capture.cell_px == 0 {
-        println!("cell px:    auto");
-    } else {
-        println!("cell px:    {}", cfg.capture.cell_px);
+    println!("addons dir: {}", cfg.slot_bank().addons_dir().display());
+    println!("slots:      {}", cfg.slots);
+    match cfg.capture.strip {
+        Some(settings) => println!(
+            "strip:      {}x{} points at {},{}",
+            settings.width, settings.height, settings.x, settings.y
+        ),
+        None => println!("strip:      not calibrated (run `ocw probe`)"),
     }
+    println!(
+        "capture:    {}",
+        cfg.capture.command.clone().unwrap_or_else(|| "(platform default)".to_string())
+    );
     match config::read_service_registration() {
         Some((url, _)) => println!("service:    {url}"),
         None => println!("service:    (no registration found)"),
@@ -701,8 +591,8 @@ fn cmd_paths(cfg: &Config, config_path: &PathBuf) -> Result<()> {
         None => println!("wow pid:    (not running)"),
     }
     println!(
-        "addon installed: {}",
-        if cfg.bank().is_installed() { "yes" } else { "no" }
+        "slots installed: {}",
+        if cfg.slot_bank().is_installed() { "yes" } else { "no" }
     );
     Ok(())
 }

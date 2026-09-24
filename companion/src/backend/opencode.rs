@@ -160,6 +160,37 @@ impl OpenCode {
         Ok(value.get("data").cloned().unwrap_or(value))
     }
 
+    /// `GET /api/model/default`
+    pub fn default_model(&self) -> Result<Option<ModelRef>> {
+        let value = self.client.get_json("/api/model/default")?;
+        let Some(data) = value.get("data") else {
+            return Ok(None);
+        };
+        let provider_id = data.get("providerID").and_then(|v| v.as_str());
+        let model_id = data
+            .get("modelID")
+            .or_else(|| data.get("id"))
+            .and_then(|v| v.as_str());
+        match (provider_id, model_id) {
+            (Some(provider_id), Some(model_id)) => Ok(Some(ModelRef {
+                provider_id: provider_id.to_string(),
+                model_id: model_id.to_string(),
+            })),
+            _ => Ok(None),
+        }
+    }
+
+    /// `POST /api/session/{id}/model` — switch an existing session's model.
+    pub fn switch_model(&self, session: &str, model: &ModelRef) -> Result<()> {
+        self.client
+            .post_json(
+                &format!("/api/session/{session}/model"),
+                &json!({ "model": model.to_json() }),
+            )?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// `GET /api/vcs`
     pub fn vcs_info(&self) -> Result<Value> {
         self.client.get_json("/api/vcs")
