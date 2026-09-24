@@ -13,3 +13,4 @@ addon/OCWow/Fonts/*.tmp
 # OS noise
 .DS_Store
 Thumbs.db
+.idea
