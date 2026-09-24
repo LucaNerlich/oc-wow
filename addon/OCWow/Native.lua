@@ -41,11 +41,12 @@ N.TRAIL = P.utf8char(N.CODEPOINT_TRAIL)
 N.CAL_LOW = P.utf8char(N.CODEPOINT_CAL_LOW)
 N.CAL_HIGH = P.utf8char(N.CODEPOINT_CAL_HIGH)
 
+--- Details of the last failed calibration, surfaced in the in-game message.
+N.last_calibration = nil
+
 local GLYPHS_PER_FRAME = 48
 local MAX_CAL_TRIES = 30
 local MIN_CAL_SPAN = 50
-
-local unpack = unpack or table.unpack
 
 local measurer
 local worker
@@ -91,9 +92,12 @@ function N.parse_packet(bytes)
 	end
 
 	local payload_len = math.min(get16(bytes, 14), N.PAYLOAD_MAX)
-	local payload = {}
+	-- Build the payload string one byte at a time: `unpack` is not guaranteed to
+	-- exist in every client build, and `string.char` with ~500 arguments is a
+	-- needless risk.
+	local chunks = {}
 	for i = 1, payload_len do
-		payload[i] = bytes[N.HEADER_BYTES + i]
+		chunks[i] = string.char(bytes[N.HEADER_BYTES + i])
 	end
 
 	return {
@@ -106,7 +110,7 @@ function N.parse_packet(bytes)
 		revision = get32(bytes, 16),
 		slot = get16(bytes, 20),
 		flags = bytes[23],
-		payload = string.char(unpack(payload)),
+		payload = table.concat(chunks),
 	}
 end
 
@@ -182,6 +186,14 @@ function N.step(job)
 		end
 		job.tries = job.tries + 1
 		if job.tries > MAX_CAL_TRIES then
+			-- Report what was measured: this separates "the font never loaded"
+			-- from "the font loaded but its widths are unusable".
+			N.last_calibration = string.format(
+				"low=%.1f high=%.1f slot=%d",
+				low or -1,
+				high or -1,
+				job.slot
+			)
 			N.finish(job, nil, "font-not-ready")
 		end
 		return

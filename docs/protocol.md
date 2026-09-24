@@ -127,9 +127,12 @@ slot. Glyph assignment:
 | `U+E200` | 514 | 256 | calibration for byte 0 |
 | `U+E201` | 515 | 4336 | calibration for byte 255 |
 
-Each glyph also contains a filled rectangle whose width is `advance - 64`, so
-the encoding survives whether the client's width measurement is advance-based
-or ink-based.
+**Glyphs carry no outline.** The data lives only in the `hmtx` advance widths.
+This is not a stylistic choice: the client rasterises glyphs into a shared font
+atlas while measuring text, and 512 wide glyphs overflow that atlas, crashing
+the client with `ASSERTNN(freedPixels >= pixelsNeeded)` in
+`GxuFontMiscClasses.cpp`. Empty glyphs cost the atlas nothing and still report
+their advance width. `companion/tests` pins this invariant.
 
 The addon measures (font size 64) and normalises:
 

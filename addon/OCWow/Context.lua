@@ -22,11 +22,45 @@ C.TIER_LIGHT = 0
 C.TIER_NORMAL = 1
 C.TIER_FULL = 2
 
-local function call(fn, ...)
-	local ok, a, b, c = pcall(fn, ...)
-	if ok then
-		return a, b, c
+-- Some client builds return "secret" values from combat APIs. They cannot be
+-- formatted, concatenated or compared, so drop them at the source. The checker
+-- is looked up dynamically because it does not exist on older clients.
+local secret_check = rawget(_G, "issecretvalue") or rawget(_G, "isSecretValue")
+
+local function is_secret(value)
+	if value == nil or secret_check == nil then
+		return false
 	end
+	local ok, secret = pcall(secret_check, value)
+	return ok and secret and true or false
+end
+
+local function call(fn, ...)
+	-- Six values covers every API used here (GetInstanceInfo's difficulty name
+	-- is the fourth, for example).
+	local ok, a, b, c, d, e, f = pcall(fn, ...)
+	if not ok then
+		return
+	end
+	if is_secret(a) then
+		a = nil
+	end
+	if is_secret(b) then
+		b = nil
+	end
+	if is_secret(c) then
+		c = nil
+	end
+	if is_secret(d) then
+		d = nil
+	end
+	if is_secret(e) then
+		e = nil
+	end
+	if is_secret(f) then
+		f = nil
+	end
+	return a, b, c, d, e, f
 end
 
 local function round(n)
@@ -227,13 +261,20 @@ local function professions_line()
 end
 
 local function add(lines, key, value)
-	if value and value ~= "" then
-		lines[#lines + 1] = key .. ": " .. value
+	if value == nil or value == "" then
+		return
+	end
+	-- Guarded: a value derived from a secret would make the concatenation fail.
+	local ok, line = pcall(function()
+		return key .. ": " .. tostring(value)
+	end)
+	if ok and type(line) == "string" then
+		lines[#lines + 1] = line
 	end
 end
 
 --- Build the game-state block for the given tier.
-function C.snapshot(tier)
+local function build_snapshot(tier)
 	tier = tier or C.TIER_LIGHT
 	local lines = {}
 	add(lines, "player", player_line())
@@ -264,4 +305,16 @@ function C.snapshot(tier)
 	end
 
 	return table.concat(lines, "\n")
+end
+
+--- Build the game-state block for the given tier.
+---
+--- Wrapped in pcall: a context failure must never block a prompt. Returns an
+--- empty string when anything goes wrong.
+function C.snapshot(tier)
+	local ok, result = pcall(build_snapshot, tier)
+	if ok and type(result) == "string" then
+		return result
+	end
+	return ""
 end

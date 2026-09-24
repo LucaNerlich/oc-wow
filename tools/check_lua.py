@@ -17,6 +17,21 @@ OPENERS = {"function", "if", "for", "while", "repeat"}
 # `do` belongs to a preceding `for`/`while`; only a standalone `do` opens a block.
 DO_OWNERS = {"for", "while"}
 
+# Globals that are absent or unsafe in the WoW client's Lua. This build omits
+# `math.randomseed`, so treat these as errors rather than discoveries.
+STRIPPED_GLOBALS = [
+    "loadstring",
+    "dofile",
+    "loadfile",
+    "collectgarbage",
+    "setfenv",
+    "getfenv",
+    "require",
+    "math.randomseed",
+    "math.random",
+    "unpack",
+]
+
 
 def strip_comments_and_strings(src: str) -> str:
     out = []
@@ -73,6 +88,34 @@ def strip_comments_and_strings(src: str) -> str:
     return "".join(out)
 
 
+def check_method_calls(code: str) -> list:
+    """A method access `obj:name` is always a call in Lua, so it must be
+    followed by an argument list. Catching this turns `x:Method and y` (a
+    parse error) into a clear diagnostic."""
+    errors = []
+    allowed = {"(", "{", '"'}
+    for match in re.finditer(r":([A-Za-z_][A-Za-z0-9_]*)", code):
+        rest = code[match.end():]
+        nxt = rest.lstrip()[:1]
+        if nxt and nxt not in allowed:
+            line = code[: match.start()].count("\n") + 1
+            errors.append(
+                f"line {line}: `:{match.group(1)}` is not followed by an "
+                f"argument list (found {nxt!r})"
+            )
+    return errors
+
+
+def check_stripped_globals(code: str) -> list:
+    """Flag use of globals the WoW client does not provide."""
+    errors = []
+    for name in STRIPPED_GLOBALS:
+        for match in re.finditer(r"\b" + re.escape(name) + r"\b", code):
+            line = code[: match.start()].count("\n") + 1
+            errors.append(f"line {line}: uses unavailable global `{name}`")
+    return errors
+
+
 def check(path: str) -> list:
     with open(path, encoding="utf-8") as handle:
         src = handle.read()
@@ -109,6 +152,9 @@ def check(path: str) -> list:
 
     if not errors and stack:
         errors.append(f"unclosed block(s): {', '.join(reversed(stack))}")
+
+    errors.extend(check_method_calls(code))
+    errors.extend(check_stripped_globals(code))
 
     return [f"{path}: {e}" for e in errors]
 

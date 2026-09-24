@@ -32,7 +32,15 @@ local RECEIVE_INTERVAL = 0.30
 --- Font-bank size created by `ocw install`.
 local BANK_SIZE = 4096
 
-local db
+-- Defaults so the module never nil-indexes, even if SavedVariables are absent
+-- (a fresh install has no OCWowDB file) or ADDON_LOADED was somehow missed.
+local db = {
+	next_slot = 1,
+	context_tier = C.TIER_LIGHT,
+	include_context = true,
+	transport_enabled = true,
+}
+local initialized = false
 local strip
 local ticker
 local accum = 0
@@ -49,7 +57,19 @@ local state = {
 local TIER_NAMES = { "light", "normal", "full" }
 
 function M.init()
+	if initialized then
+		return
+	end
+	initialized = true
+
+	-- The client does not pre-create the SavedVariables table, and it will even
+	-- persist `OCWowDB = nil` if the global was nil at logout, so recover from
+	-- any non-table value rather than just nil.
+	if type(OCWowDB) ~= "table" then
+		OCWowDB = {}
+	end
 	db = OCWowDB
+
 	if not db.next_slot or db.next_slot < 1 then
 		db.next_slot = 1
 	end
@@ -59,16 +79,29 @@ function M.init()
 	if db.include_context == nil then
 		db.include_context = true
 	end
+	if db.transport_enabled == nil then
+		db.transport_enabled = true
+	end
 
-	math.randomseed(math.floor(GetTime() * 1000) % 2147483647)
-	state.ui_session = math.random(1, 65535)
+	-- Some client builds omit `math.randomseed`, and an unseeded `math.random`
+	-- repeats the same sequence every session, so derive the session id from the
+	-- clock instead of the RNG.
+	local clock = (time() or 0) * 1000 + math.floor((GetTime() or 0) * 1000)
+	state.ui_session = (clock % 65535) + 1
 	state.context_tier = db.context_tier
 	state.include_context = db.include_context
 end
 
 function M.setup()
+	-- Idempotent: guarantees db and the session id even if ADDON_LOADED was
+	-- missed, since PLAYER_LOGIN always fires.
+	M.init()
+
 	strip = P.create_strip(UIParent)
 	N.init(UIParent)
+	if not db.transport_enabled then
+		strip:Hide()
+	end
 	U.create(M.send_prompt)
 	U.set_context_tier(state.context_tier)
 	U.on_context_click = M.cycle_context
@@ -95,6 +128,9 @@ end
 -- ---------------------------------------------------------------------------
 
 function M.tick()
+	if not db.transport_enabled then
+		return
+	end
 	if state.calibrating then
 		P.render_strip(strip, P.idle_frame(state.ui_session))
 		return
@@ -217,8 +253,13 @@ function M.on_reply(pending, packet, reason)
 	if not packet then
 		pending.stale = (pending.stale or 0) + 1
 		if pending.stale >= 10 then
+			local detail = N.last_calibration and (" [" .. N.last_calibration .. "]") or ""
 			U.add(
-				"transport stalled (" .. tostring(reason) .. "). Is the companion running, and the strip visible and unobscured?",
+				"transport stalled ("
+					.. tostring(reason)
+					.. ")"
+					.. detail
+					.. ". Is the companion running, and the strip visible and unobscured?",
 				1,
 				0.5,
 				0.3
@@ -283,6 +324,11 @@ end
 function M.send_prompt(text)
 	text = text and text:match("^%s*(.-)%s*$") or ""
 	if text == "" then
+		return
+	end
+
+	if not db.transport_enabled then
+		U.add("transport is off; use /ocw transport on to enable", 1, 0.6, 0.3)
 		return
 	end
 
@@ -376,6 +422,23 @@ local COMMANDS = {
 	status = function()
 		U.add(M.status_text(), 0.85, 0.85, 0.85)
 	end,
+	transport = function(_, rest)
+		if rest == "off" then
+			db.transport_enabled = false
+			if strip then
+				strip:Hide()
+			end
+			U.add("transport off: strip hidden, no font reads", 0.9, 0.8, 0.4)
+		elseif rest == "on" then
+			db.transport_enabled = true
+			if strip then
+				strip:Show()
+			end
+			U.add("transport on", 0.7, 0.9, 0.7)
+		else
+			U.add("usage: /ocw transport on|off", 0.8, 0.8, 0.8)
+		end
+	end,
 	context = function(_, rest)
 		if rest == "on" then
 			state.include_context = true
@@ -419,14 +482,28 @@ end
 -- Bootstrap
 -- ---------------------------------------------------------------------------
 
+local function report_failure(stage, err)
+	local message = string.format("OCWow: %s failed: %s", stage, tostring(err))
+	print(message)
+	if U and U.add then
+		pcall(U.add, message, 1, 0.4, 0.4)
+	end
+end
+
 local events = CreateFrame("Frame")
 events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 events:SetScript("OnEvent", function(_, event, arg1)
 	if event == "ADDON_LOADED" and arg1 == "OCWow" then
-		M.init()
+		local ok, err = pcall(M.init)
+		if not ok then
+			report_failure("init", err)
+		end
 	elseif event == "PLAYER_LOGIN" then
-		M.setup()
+		local ok, err = pcall(M.setup)
+		if not ok then
+			report_failure("setup", err)
+		end
 	end
 end)
 

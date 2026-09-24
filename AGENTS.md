@@ -55,6 +55,11 @@ python3 tools/validate_font.py <font.ttf>         # macOS CoreText validation
 * **Never rewrite a font slot the addon may have already loaded.** Slots are
   consumed monotonically; reuse only after the companion detects a new WoW
   process id.
+* **Generated glyphs must carry no outline.** The client rasterises glyph
+  outlines into a shared font atlas while measuring text, and hundreds of large
+  glyphs overflow it — a hard client crash
+  (`ASSERTNN(freedPixels >= pixelsNeeded)` in `GxuFontMiscClasses.cpp`). Data
+  lives in `hmtx` advance widths only; `glyphs_carry_no_outline` pins this.
 * **Keep both protocol implementations in sync** and update `docs/protocol.md`.
 * **Keep the context block capped** (`context::MAX_CONTEXT_BYTES`) so game
   state cannot dominate a prompt.
@@ -62,6 +67,16 @@ python3 tools/validate_font.py <font.ttf>         # macOS CoreText validation
   whole design exists to avoid those; a change that introduces them is wrong.
 * Lua is 5.1: no `goto`, no integer division, use `math.floor`. Guard WoW API
   calls that differ across client builds with `pcall`.
+* **Always guard SavedVariables with `if type(DB) ~= "table" then DB = {} end`.**
+  The client does not pre-create the table, and it will persist `DB = nil` if
+  the global was nil at logout — which then re-nils it on every subsequent load.
+  Set any file-local defaults *before* `ADDON_LOADED` so the module can never
+  nil-index.
+* **Never format or concatenate a value from a combat API without checking it.**
+  This client returns "secret" values (`issecretvalue`) from `UnitHealth`,
+  `UnitPower` and friends; formatting one yields a secret *string*, and
+  `table.concat` rejects it. Route such calls through `Context.call`, which
+  drops secrets, and keep the `pcall` wrapper on `C.snapshot`.
 * The addon must never assume a file exists; it only measures fonts by path.
 
 ## Testing changes
@@ -71,7 +86,8 @@ python3 tools/validate_font.py <font.ttf>         # macOS CoreText validation
   independently validates structure and advances.
 * App changes: extend `ocw selftest` (offline) and, for backend changes, the
   `--live` variant.
-* Lua changes: `tools/check_lua.py`, then a real `/reload` in game.
+* Lua changes: `tools/check_lua.py` (block balance, method-call syntax, and
+  use of globals this client omits), then a real `/reload` in game.
 
 ## Known empirical dependencies
 

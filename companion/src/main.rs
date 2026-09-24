@@ -11,7 +11,7 @@
 //!   * `font`     - build a reply font from text (debug)
 //!   * `paths`    - show resolved paths
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -28,6 +28,15 @@ use ocw::protocol::frames::{
 use ocw::protocol::pixel;
 
 /// Addon sources embedded so the binary is self-contained on any platform.
+const ADDON_FILE_NAMES: &[&str] = &[
+    "OCWow.toc",
+    "Protocol.lua",
+    "Native.lua",
+    "Context.lua",
+    "UI.lua",
+    "Main.lua",
+];
+
 const ADDON_FILES: &[(&str, &str)] = &[
     ("OCWow.toc", include_str!("../../addon/OCWow/OCWow.toc")),
     ("Protocol.lua", include_str!("../../addon/OCWow/Protocol.lua")),
@@ -36,6 +45,26 @@ const ADDON_FILES: &[(&str, &str)] = &[
     ("UI.lua", include_str!("../../addon/OCWow/UI.lua")),
     ("Main.lua", include_str!("../../addon/OCWow/Main.lua")),
 ];
+
+/// Load the addon sources from a directory, or fall back to the embedded copies.
+fn load_addon_sources(from: Option<&Path>) -> Result<Vec<(String, String)>> {
+    match from {
+        None => Ok(ADDON_FILES
+            .iter()
+            .map(|(name, contents)| ((*name).to_string(), (*contents).to_string()))
+            .collect()),
+        Some(dir) => {
+            let mut sources = Vec::with_capacity(ADDON_FILE_NAMES.len());
+            for name in ADDON_FILE_NAMES {
+                let path = dir.join(name);
+                let contents = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                sources.push(((*name).to_string(), contents));
+            }
+            Ok(sources)
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -95,6 +124,10 @@ struct InstallArgs {
     /// Only write the Lua addon files, not the font bank.
     #[arg(long)]
     no_bank: bool,
+    /// Read the addon Lua/TOC from this directory instead of the copies
+    /// embedded in the binary. Lets you deploy addon edits without rebuilding.
+    #[arg(long)]
+    from: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -204,7 +237,7 @@ fn run() -> Result<()> {
     match cli.command {
         Command::Install(args) => cmd_install(&mut cfg, &config_path, args),
         Command::Probe(args) => cmd_probe(&mut cfg, args),
-        Command::Run(args) => cmd_run(&mut cfg, args, cli.verbose),
+        Command::Run(args) => cmd_run(&mut cfg, &config_path, args, cli.verbose),
         Command::Ping(args) => cmd_ping(&cfg, args),
         Command::Models(args) => cmd_models(&cfg, args),
         Command::Projects(args) => cmd_projects(&cfg, args),
@@ -279,11 +312,30 @@ fn cmd_install(cfg: &mut Config, config_path: &PathBuf, args: InstallArgs) -> Re
     std::fs::create_dir_all(&addon_dir)
         .with_context(|| format!("creating addon directory {}", addon_dir.display()))?;
 
-    for (name, contents) in ADDON_FILES {
+    let sources = load_addon_sources(args.from.as_deref())?;
+    for (name, contents) in &sources {
         let path = addon_dir.join(name);
         std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
     }
-    println!("wrote {} addon files to {}", ADDON_FILES.len(), addon_dir.display());
+    let origin = match &args.from {
+        Some(dir) => format!("from {}", dir.display()),
+        None => "from the embedded copies".to_string(),
+    };
+    println!(
+        "wrote {} addon files to {} ({origin})",
+        sources.len(),
+        addon_dir.display()
+    );
+
+    if args.from.is_none() {
+        let local = PathBuf::from("addon/OCWow");
+        if local.join("OCWow.toc").is_file() {
+            println!(
+                "note: ./addon/OCWow exists; use --from addon/OCWow to deploy local \
+                 edits without rebuilding"
+            );
+        }
+    }
 
     if !args.no_bank {
         let bank = Bank::new(addon_dir.join("Fonts"), args.slots);
@@ -358,7 +410,7 @@ fn cmd_probe(cfg: &mut Config, args: ProbeArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(cfg: &mut Config, args: RunArgs, verbose: bool) -> Result<()> {
+fn cmd_run(cfg: &mut Config, config_path: &PathBuf, args: RunArgs, verbose: bool) -> Result<()> {
     apply_capture_overrides(
         cfg,
         args.crop.as_ref(),
@@ -387,6 +439,7 @@ fn cmd_run(cfg: &mut Config, args: RunArgs, verbose: bool) -> Result<()> {
     };
 
     let mut app = App::new(cfg.clone(), backend, verbose)?;
+    app.set_config_path(config_path.clone());
     app.check_bank()?;
     if let Some(ms) = args.poll_ms {
         app.set_poll_ms(ms);
@@ -614,18 +667,21 @@ fn cmd_selftest(cfg: &mut Config, args: SelftestArgs) -> Result<()> {
     let _ = std::fs::remove_dir_all(&dir);
 
     let expected = if args.live { "pong" } else { "hello from the fake addon" };
+    if !project_ok {
+        bail!("SELFTEST FAILED: session was not scoped to the requested project");
+    }
     match reply {
-        Some(text) if text.to_lowercase().contains(expected) && project_ok => {
+        Some(text) if text.to_lowercase().contains(expected) => {
             println!("SELFTEST PASSED: reply round-tripped through the font bank");
             Ok(())
         }
-        Some(text) if !project_ok => bail!("SELFTEST FAILED: session was not scoped to the project"),
         Some(text) => bail!("SELFTEST FAILED: unexpected reply {text:?}"),
         None => bail!("SELFTEST FAILED: no reply arrived"),
     }
 }
 
-fn cmd_paths(cfg: &Config, config_path: &PathBuf) -> Result<()> {    println!("config:     {}", config_path.display());
+fn cmd_paths(cfg: &Config, config_path: &PathBuf) -> Result<()> {
+    println!("config:     {}", config_path.display());
     println!("state:      {}", ocw::state::default_state_path().display());
     println!("addon dir:  {}", cfg.addon_dir.display());
     println!("font bank:  {}", cfg.bank().dir().display());

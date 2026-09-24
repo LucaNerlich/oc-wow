@@ -9,10 +9,16 @@
 //! | `U+E200`       | 514   | calibration glyph for byte 0              |
 //! | `U+E201`       | 515   | calibration glyph for byte 255            |
 //!
-//! A data glyph for byte `b` has advance width `(16 + b) * 16` font units and a
-//! filled rectangle whose width is `advance - 64`. Both the *advance* and the
-//! *ink extent* therefore increase with `b`, so the encoding survives whether
-//! the client's width measurement is advance-based or ink-based.
+//! A data glyph for byte `b` has advance width `(16 + b) * 16` font units.
+//! Glyphs carry only a **tiny** box outline, never a large one. Two hard-won
+//! constraints from testing against the client:
+//!
+//! * A large outline (the byte value scaled into ink) overflows the client's
+//!   font atlas when measuring, crashing it (`GxuFontMiscClasses.cpp`).
+//! * A glyph with *no* outline is treated as missing and substituted with a
+//!   fallback, which destroys the advance measurement.
+//!
+//! So every glyph gets the same small box; only the advance carries data.
 //!
 //! The addon recovers a byte with:
 //!
@@ -62,16 +68,12 @@ pub fn codepoint_for_data(i: usize) -> u32 {
     CODEPOINT_DATA_BASE + i as u32
 }
 
-/// Height of the rectangle drawn inside every glyph, in font units.
-const GLYPH_RECT_HEIGHT: i16 = 100;
-/// Right side bearing subtracted from the advance to size each rectangle.
-const GLYPH_SIDE_BEARING: i16 = 64;
-/// Serialised size of one simple glyph (1 contour, 4 points, no hinting).
+/// Ink box size for every glyph, in font units. At the measurement size this is
+/// only a few pixels square, which keeps the client's font atlas happy while
+/// still giving the glyph a real outline.
+const GLYPH_BOX: i16 = 64;
+/// Serialised size of one glyph: 1 contour, 4 points, no hinting.
 const GLYPH_LEN: usize = 34;
-
-fn advance_to_rect_width(advance: u16) -> i16 {
-    (advance as i16 - GLYPH_SIDE_BEARING).max(16)
-}
 
 // ---------------------------------------------------------------------------
 // Byte writer helpers
@@ -126,34 +128,30 @@ fn checksum(data: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 fn build_glyf(advances: &[u16]) -> Vec<u8> {
+    // Every glyph is the same tiny box; the advance widths in `hmtx` carry the
+    // data. See the module docs for why it cannot be empty and cannot be large.
     let mut out = Vec::with_capacity(advances.len() * GLYPH_LEN);
-    for &advance in advances {
-        let w = advance_to_rect_width(advance);
-        let h = GLYPH_RECT_HEIGHT;
-
-        // Simple glyph header.
+    for _ in advances {
         out.extend_from_slice(&1i16.to_be_bytes()); // numberOfContours
         out.extend_from_slice(&0i16.to_be_bytes()); // xMin
         out.extend_from_slice(&0i16.to_be_bytes()); // yMin
-        out.extend_from_slice(&w.to_be_bytes()); // xMax
-        out.extend_from_slice(&h.to_be_bytes()); // yMax
+        out.extend_from_slice(&GLYPH_BOX.to_be_bytes()); // xMax
+        out.extend_from_slice(&GLYPH_BOX.to_be_bytes()); // yMax
 
         out.extend_from_slice(&3u16.to_be_bytes()); // endPtsOfContours[0]
         out.extend_from_slice(&0u16.to_be_bytes()); // instructionLength
+        out.extend_from_slice(&[0x01, 0x01, 0x01, 0x01]); // on-curve flags
 
-        // Four on-curve points, all coordinates written as i16 deltas.
-        out.extend_from_slice(&[0x01, 0x01, 0x01, 0x01]); // flags
+        // x deltas: 0, +box, 0, -box
+        out.extend_from_slice(&0i16.to_be_bytes());
+        out.extend_from_slice(&GLYPH_BOX.to_be_bytes());
+        out.extend_from_slice(&0i16.to_be_bytes());
+        out.extend_from_slice(&(-GLYPH_BOX).to_be_bytes());
 
-        // x deltas: 0, w, 0, -w
-        out.extend_from_slice(&0i16.to_be_bytes());
-        out.extend_from_slice(&w.to_be_bytes());
-        out.extend_from_slice(&0i16.to_be_bytes());
-        out.extend_from_slice(&(-w).to_be_bytes());
-
-        // y deltas: 0, 0, h, 0
+        // y deltas: 0, 0, +box, 0
         out.extend_from_slice(&0i16.to_be_bytes());
         out.extend_from_slice(&0i16.to_be_bytes());
-        out.extend_from_slice(&h.to_be_bytes());
+        out.extend_from_slice(&GLYPH_BOX.to_be_bytes());
         out.extend_from_slice(&0i16.to_be_bytes());
     }
     out
@@ -187,7 +185,7 @@ fn build_hhea(advance_max: u16) -> Vec<u8> {
     b.u16(advance_max); // advanceWidthMax
     b.i16(0); // minLeftSideBearing
     b.i16(0); // minRightSideBearing
-    b.i16(advance_max as i16); // xMaxExtent
+    b.i16(GLYPH_BOX); // xMaxExtent (the tiny box every glyph shares)
     b.i16(1); // caretSlopeRise
     b.i16(0); // caretSlopeRun
     b.i16(0); // caretOffset
@@ -232,8 +230,8 @@ fn build_head(index_to_loc_format: i16) -> Vec<u8> {
     b.i64(0); // modified
     b.i16(0); // xMin
     b.i16(0); // yMin
-    b.i16(ADVANCE_BASE as i16 + ADVANCE_STEP as i16 * 255); // xMax
-    b.i16(GLYPH_RECT_HEIGHT); // yMax
+    b.i16(GLYPH_BOX); // xMax (the tiny box every glyph shares)
+    b.i16(GLYPH_BOX); // yMax
     b.u16(0); // macStyle
     b.u16(8); // lowestRecPPEM
     b.i16(2); // fontDirectionHint
@@ -593,6 +591,29 @@ mod tests {
 
         let advances = read_advances(&font);
         assert_eq!(advances.len(), NUM_GLYPHS as usize);
+    }
+
+    #[test]
+    fn glyphs_have_only_a_tiny_outline() {
+        // Two constraints, both learned from live testing:
+        //  * a large outline overflows the client's font atlas while measuring
+        //    (a hard crash in GxuFontMiscClasses.cpp);
+        //  * an outline-less glyph is treated as missing and substituted with a
+        //    fallback, which destroys the advance measurement.
+        let font = build_baseline_font();
+        let dir = parse_directory(&font);
+        let (_, _, offset, length) = dir
+            .iter()
+            .find(|(tag, _, _, _)| tag == b"glyf")
+            .expect("glyf table");
+        let data = &font[*offset as usize..(*offset + *length) as usize];
+        assert_eq!(data.len(), NUM_GLYPHS as usize * GLYPH_LEN);
+        for (index, chunk) in data.chunks(GLYPH_LEN).enumerate() {
+            let contours = i16::from_be_bytes([chunk[0], chunk[1]]);
+            assert_eq!(contours, 1, "glyph {index} must have exactly one contour");
+            let x_max = i16::from_be_bytes([chunk[6], chunk[7]]);
+            assert_eq!(x_max, GLYPH_BOX, "glyph {index} outline must stay tiny");
+        }
     }
 
     #[test]

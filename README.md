@@ -86,30 +86,94 @@ needs one confirmation in game.
 
 ## Quick start
 
+Only the last step needs to run each time you play: `ocw run` **is** the
+companion process, so it must be running (in any terminal) while you are in
+game.
+
+### Two command surfaces
+
+These are easy to confuse, so to be explicit:
+
+* **Your terminal** (outside the game) runs the `ocw` binary: `install`,
+  `probe`, `run`, `ping`, `models`, `projects`, `dump`, `font`, `selftest`,
+  `paths`. Typing these into WoW's chat box does nothing.
+* **WoW's chat box** (in game) runs slash commands: `/ocw`, `/ocw calibrate`,
+  `/ocw ctx`, `/ocw context on|off`, `/ocw new`, `/ocw stop`,
+  `/ocw model <provider/model>`, `/ocw help`, `/ocw status`. Typing these into a
+  terminal does nothing.
+
+Once `ocw run` is running, you mostly stay in game: open the panel with `/ocw`
+and type prompts into its input box, or send a one-liner from chat with
+`/ocw <prompt>` (anything after `/ocw` that is not a known subcommand is sent as
+a prompt).
+
+### One-time setup
+
 ```sh
 cd companion
 cargo build --release          # produces target/release/ocw
 
-# 1. install the addon and build the font bank
+# install the addon and build the font bank
 ./target/release/ocw install --addon-dir "/Applications/World of Warcraft/_classic_beta_/Interface/AddOns/OCWow"
+```
 
-# 2. enable OCWow in the addon list, then /reload; run /ocw calibrate in game
+In game: enable **OCWow** in the addon list, then `/reload`.
 
-# 3. find the strip on screen (optional: run auto-calibrates at startup)
-./target/release/ocw probe
+Optional, once: `/ocw calibrate` in game and `ocw probe` in a terminal, which
+finds the strip and saves the exact crop. You can skip this — `ocw run`
+auto-calibrates on startup.
 
-# 4. serve the bridge
+### Every play session
+
+```sh
 ./target/release/ocw run --project ~/code/my-project
 ```
 
-Then in game: `/ocw`, type a prompt, press Enter.
+Leave it running while you play. Then in game: `/ocw`, type a prompt, press
+Enter. Closing the terminal stops the bridge.
 
 `ocw run --mock` uses a local echo backend, which is the fastest way to verify
 the transport before involving a model.
 
-If the crop is wrong, `run` captures once at startup, searches for the strip,
-and adopts what it finds — so `probe` is mainly a diagnostic and a way to
-persist an exact crop.
+On startup the companion captures once, searches for the strip, adopts what it
+finds and saves the crop to the config — so `probe` is mainly a diagnostic, and
+later runs start already calibrated. If you move the WoW window to another
+monitor or change UI scale, the saved crop stops decoding and `run`
+re-calibrates automatically.
+
+## Updating
+
+The addon sources are embedded in the binary, so `ocw install` is the whole
+deploy step. What you need to do depends on what changed:
+
+| Changed | Rebuild the binary? | Regenerate the font bank? |
+|---------|--------------------|---------------------------|
+| Addon Lua / TOC | no, with `--from` | no |
+| Wire protocol or font format | yes | yes (`--force`) |
+| Fresh checkout | yes | yes (first install) |
+
+Fast loop while editing the addon — no Rust rebuild:
+
+```sh
+ocw install --from addon/OCWow --no-bank
+```
+
+Full update from a built binary:
+
+```sh
+cargo build --release
+./target/release/ocw install
+```
+
+Then `/reload` in game. A full client restart is only needed after the **font
+bank** changes, because the client discovers addon resources at startup.
+
+Two cautions:
+
+- `--force` rewrites every font slot and **must not** run while the game is
+  running — the client may already have loaded those files.
+- After a game patch, bump `## Interface:` in `addon/OCWow/OCWow.toc` to the new
+  build number, or the addon is flagged as out of date.
 
 ## Commands
 
@@ -148,6 +212,7 @@ In-game:
 | `/ocw context on\|off` | include or omit game state |
 | `/ocw new`, `/ocw stop`, `/ocw model <provider/model>`, `/ocw help` | session commands |
 | `/ocw status` | transport diagnostics |
+| `/ocw transport on\|off` | disable the strip and all font reads (safety switch) |
 
 ## Game context
 

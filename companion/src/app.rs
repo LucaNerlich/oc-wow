@@ -113,6 +113,7 @@ impl Partial {
 /// The companion application.
 pub struct App {
     config: Config,
+    config_path: PathBuf,
     bank: Bank,
     capturer: Capturer,
     state: State,
@@ -149,6 +150,7 @@ impl App {
 
         Ok(Self {
             project: config.opencode.project.clone(),
+            config_path: crate::config::default_config_path(),
             config,
             bank,
             capturer,
@@ -180,6 +182,11 @@ impl App {
     /// Override the strip sampling interval.
     pub fn set_poll_ms(&mut self, ms: u64) {
         self.poll_ms = ms.max(20);
+    }
+
+    /// Set the configuration file used to persist calibration results.
+    pub fn set_config_path(&mut self, path: PathBuf) {
+        self.config_path = path;
     }
 
     /// Start the worker thread without entering the capture loop.
@@ -294,6 +301,12 @@ impl App {
                     self.config.capture.width,
                     self.config.capture.height
                 );
+                // Remember the crop so later runs start calibrated.
+                if let Err(err) = self.config.save(&self.config_path) {
+                    eprintln!("[ocw] could not save calibration: {err}");
+                } else {
+                    eprintln!("[ocw] saved to {}", self.config_path.display());
+                }
             }
             None => eprintln!(
                 "[ocw] warning: strip not found in the capture; run `ocw probe` \

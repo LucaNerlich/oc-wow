@@ -144,6 +144,45 @@ $b.Save('{out}',[Drawing.Imaging.ImageFormat]::Png)"
 Pass it with `--capture-cmd '...'`. The captured PNG must be 8-bit RGB or RGBA,
 non-interlaced.
 
+## Updating
+
+`ocw install` deploys the addon; the sources are embedded in the binary so it
+works from anywhere. What to do depends on what changed:
+
+| Changed | Rebuild? | Font bank? |
+|---------|----------|------------|
+| Addon Lua / TOC | no (`--from`) | no (`--no-bank`) |
+| Wire protocol / font format | yes | yes (`--force`) |
+
+**Editing the addon** (fastest loop, no rebuild):
+
+```sh
+ocw install --from addon/OCWow --no-bank
+```
+
+**Normal update:**
+
+```sh
+cargo build --release
+./target/release/ocw install
+```
+
+Then `/reload` in game.
+
+**If the font bank changed** (only after editing `companion/src/fonts/`):
+
+```sh
+# with the game CLOSED
+ocw install --force
+```
+
+`--force` rewrites all slots. Never run it while the client is running: the
+client caches font files on first use, and a slot it has already loaded cannot
+be changed safely.
+
+**After a game patch**, update `## Interface:` in `addon/OCWow/OCWow.toc` to the
+new build number (currently `16001`), or the addon is flagged out of date.
+
 ## Troubleshooting
 
 **`no strip found`**

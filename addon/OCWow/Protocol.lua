@@ -200,7 +200,9 @@ function P.create_strip(parent)
 	local strip = CreateFrame("Frame", "OCWowStrip", parent)
 	strip:SetSize(P.STRIP_COLS * P.CELL_PX, P.STRIP_ROWS * P.CELL_PX)
 	strip:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 8, -8)
-	strip:SetFrameStrata("BACKGROUND")
+	-- High strata so game UI (the player frame lives in this corner) can never
+	-- cover the strip: anything drawn on top of it breaks decoding.
+	strip:SetFrameStrata("TOOLTIP")
 	strip.cells = {}
 	strip.state = {}
 	for row = 0, P.STRIP_ROWS - 1 do

@@ -31,14 +31,17 @@ local function button(parent, text, width, x, y, onClick)
 	return b
 end
 
---- Create the panel. `sender` is called with the input text on Send/Enter.
-function U.create(sender)
-	on_send = sender
-
+--- Create the panel frame, preferring the standard dialog template and
+--- falling back to a backdrop-enabled frame if that template is missing.
+local function create_panel_frame()
 	local ok, frame = pcall(CreateFrame, "Frame", "OCWowPanel", UIParent, "BasicFrameTemplateWithInset")
-	if not ok then
-		frame = CreateFrame("Frame", "OCWowPanel", UIParent)
-		frame:SetBackdrop and frame:SetBackdrop({
+	if ok and frame then
+		return frame, true
+	end
+
+	local ok_backdrop, backdrop = pcall(CreateFrame, "Frame", "OCWowPanel", UIParent, "BackdropTemplate")
+	if ok_backdrop and backdrop and backdrop.SetBackdrop then
+		backdrop:SetBackdrop({
 			bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
 			edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
 			tile = true,
@@ -46,7 +49,18 @@ function U.create(sender)
 			edgeSize = 32,
 			insets = { left = 8, right = 8, top = 8, bottom = 8 },
 		})
+		backdrop:SetBackdropColor(0, 0, 0, 0.9)
+		return backdrop, false
 	end
+
+	return CreateFrame("Frame", "OCWowPanel", UIParent), false
+end
+
+--- Create the panel. `sender` is called with the input text on Send/Enter.
+function U.create(sender)
+	on_send = sender
+
+	local frame, has_title = create_panel_frame()
 	panel = frame
 	panel:SetSize(520, 380)
 	panel:SetPoint("CENTER")
@@ -59,12 +73,12 @@ function U.create(sender)
 	panel:SetToplevel(true)
 	panel:Hide()
 
-	if panel.TitleText then
+	if has_title and panel.TitleText then
 		panel.TitleText:SetText("OCWow")
 	end
 
 	local title = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	title:SetPoint("TOP", panel, "TOP", 0, -6)
+	title:SetPoint("TOP", panel, "TOP", 0, has_title and -6 or -12)
 	title:SetText("OCWow - OpenCode")
 
 	local output = CreateFrame("ScrollingMessageFrame", nil, panel)
