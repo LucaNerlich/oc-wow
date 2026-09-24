@@ -1,0 +1,20 @@
+[package]
+name = "ocw"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop companion for the OCWow addon: drives OpenCode from inside World of Warcraft"
+license = "MIT"
+rust-version = "1.74"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+miniz_oxide = "0.8"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

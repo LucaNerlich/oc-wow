@@ -1,0 +1,15 @@
+# Rust
+/companion/target/
+**/*.rs.bk
+
+# Companion runtime state
+/companion/state/
+*.log
+
+# Generated addon assets (font bank is created by `ocw install`)
+addon/OCWow/Fonts/*.ttf
+addon/OCWow/Fonts/*.tmp
+
+# OS noise
+.DS_Store
+Thumbs.db
